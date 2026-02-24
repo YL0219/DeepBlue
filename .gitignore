@@ -2,6 +2,10 @@
 appsettings.json
 .env
 
+# AI & Workspace Configs
+CLAUDE.md
+.claude/
+
 # SQLite Databases
 *.db
 *.db-shm

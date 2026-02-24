@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deep Blue — Market Chart</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0a0e17;
+            color: #e0e6ed;
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ── Header bar ────────────────────────────────── */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 16px;
+            background: #111827;
+            border-bottom: 1px solid #1e293b;
+            flex-shrink: 0;
+        }
+
+        .header .symbol-label {
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }
+
+        .header .price-label {
+            font-size: 16px;
+            font-weight: 500;
+            color: #94a3b8;
+            margin-left: 12px;
+        }
+
+        .header .price-label.up   { color: #22c55e; }
+        .header .price-label.down { color: #ef4444; }
+
+        /* ── Timeframe buttons ─────────────────────────── */
+        .tf-bar {
+            display: flex;
+            gap: 4px;
+            padding: 8px 16px;
+            background: #111827;
+            border-bottom: 1px solid #1e293b;
+            flex-shrink: 0;
+        }
+
+        .tf-btn {
+            background: #1e293b;
+            color: #94a3b8;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            padding: 5px 14px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .tf-btn:hover {
+            background: #334155;
+            color: #e0e6ed;
+        }
+
+        .tf-btn.active {
+            background: #2563eb;
+            color: #fff;
+            border-color: #2563eb;
+        }
+
+        /* ── Chart container ───────────────────────────── */
+        #chart-container {
+            flex: 1;
+            position: relative;
+            min-height: 0;
+        }
+
+        /* ── Loading overlay ───────────────────────────── */
+        .loading-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(10, 14, 23, 0.85);
+            z-index: 10;
+            transition: opacity 0.3s;
+        }
+
+        .loading-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .spinner {
+            width: 36px;
+            height: 36px;
+            border: 3px solid #334155;
+            border-top-color: #2563eb;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ── Error banner ──────────────────────────────── */
+        .error-banner {
+            display: none;
+            padding: 10px 16px;
+            background: #7f1d1d;
+            color: #fca5a5;
+            font-size: 13px;
+            flex-shrink: 0;
+        }
+
+        .error-banner.visible { display: block; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div style="display:flex;align-items:baseline;">
+            <span class="symbol-label" id="symbol-label">---</span>
+            <span class="price-label" id="price-label"></span>
+        </div>
+        <div style="font-size:11px;color:#475569;">Deep Blue</div>
+    </div>
+
+    <div class="tf-bar" id="tf-bar">
+        <!-- Populated by JS -->
+    </div>
+
+    <div class="error-banner" id="error-banner"></div>
+
+    <div id="chart-container">
+        <div class="loading-overlay" id="loading">
+            <div class="spinner"></div>
+        </div>
+    </div>
+
+    <!-- TradingView Lightweight Charts v4 (CDN for MVP) -->
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="chart.js"></script>
+</body>
+</html>

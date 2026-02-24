@@ -1,0 +1,35 @@
+# Secret Keys & Environment Variables
+appsettings.json
+.env
+
+# SQLite Databases
+*.db
+*.db-shm
+*.db-wal
+deepblue.db
+
+# Unity Temporary & Build Files
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.boop
+
+# .NET / C# Build Files
+bin/
+obj/
+
+# Python Caches
+__pycache__/
+*.pyc

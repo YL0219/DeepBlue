@@ -33,6 +33,11 @@ namespace LifeTrader_AI.Data
         public DbSet<ChatMessage> ChatMessages { get; set; } = null!;
 
         /// <summary>
+        /// Observability log for every tool invocation in the AI agent loop.
+        /// </summary>
+        public DbSet<ToolRun> ToolRuns { get; set; } = null!;
+
+        /// <summary>
         /// Auto-increments RowVersion on any modified Position entity before saving.
         /// This ensures the concurrency token is always updated, even if the service
         /// layer forgets to do it manually.
@@ -151,6 +156,21 @@ namespace LifeTrader_AI.Data
                       .OnDelete(DeleteBehavior.SetNull);
 
                 entity.Property(c => c.CreatedAtUtc)
+                      .HasDefaultValueSql("datetime('now')");
+            });
+
+            // === ToolRun Configuration ===
+            modelBuilder.Entity<ToolRun>(entity =>
+            {
+                entity.ToTable("ToolRuns");
+
+                entity.HasIndex(t => t.ThreadId)
+                      .HasDatabaseName("IX_ToolRuns_ThreadId");
+
+                entity.HasIndex(t => t.CreatedAtUtc)
+                      .HasDatabaseName("IX_ToolRuns_CreatedAtUtc");
+
+                entity.Property(t => t.CreatedAtUtc)
                       .HasDefaultValueSql("datetime('now')");
             });
 

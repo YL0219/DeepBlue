@@ -17,6 +17,12 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 // TradingService is Scoped — shares the same DbContext lifetime as the request.
 builder.Services.AddScoped<TradingService>();
 
+// 1.7 MEMORY CACHE (Phase 3: reduces redundant API calls, 10s TTL used in controllers)
+builder.Services.AddMemoryCache();
+
+// 1.8 PYTHON PROCESS THROTTLE (Phase 3: limits concurrent Process.Start to 3)
+builder.Services.AddSingleton(new SemaphoreSlim(3, 3));
+
 // 2. OPEN THE DOORS FOR UNITY (CORS)
 // By default, web servers block requests from other apps. This disables that security feature for local testing.
 builder.Services.AddCors(options =>
@@ -28,6 +34,12 @@ builder.Services.AddCors(options =>
               .AllowAnyHeader();
     });
 });
+
+// 1.9 SECURITY: Validate required API keys at startup
+if (string.IsNullOrEmpty(builder.Configuration["OpenAI:ApiKey"]))
+    Console.WriteLine("[Backend] WARNING: OpenAI:ApiKey is not configured! AI endpoints will fail.");
+if (string.IsNullOrEmpty(builder.Configuration["Finnhub:ApiKey"]))
+    Console.WriteLine("[Backend] WARNING: Finnhub:ApiKey is not configured! Market data will fail.");
 
 var app = builder.Build();
 

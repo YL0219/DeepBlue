@@ -38,6 +38,16 @@ namespace LifeTrader_AI.Data
         public DbSet<ToolRun> ToolRuns { get; set; } = null!;
 
         /// <summary>
+        /// User watchlist symbols — active items are included in market data ingestion.
+        /// </summary>
+        public DbSet<WatchlistItem> WatchlistItems { get; set; } = null!;
+
+        /// <summary>
+        /// Metadata for ingested OHLCV Parquet files (one row per symbol+interval).
+        /// </summary>
+        public DbSet<MarketDataAsset> MarketDataAssets { get; set; } = null!;
+
+        /// <summary>
         /// Auto-increments RowVersion on any modified Position entity before saving.
         /// This ensures the concurrency token is always updated, even if the service
         /// layer forgets to do it manually.
@@ -171,6 +181,38 @@ namespace LifeTrader_AI.Data
                       .HasDatabaseName("IX_ToolRuns_CreatedAtUtc");
 
                 entity.Property(t => t.CreatedAtUtc)
+                      .HasDefaultValueSql("datetime('now')");
+            });
+
+            // === WatchlistItem Configuration ===
+            modelBuilder.Entity<WatchlistItem>(entity =>
+            {
+                entity.ToTable("WatchlistItems");
+
+                entity.HasIndex(w => w.Symbol)
+                      .HasDatabaseName("IX_WatchlistItems_Symbol");
+
+                entity.Property(w => w.AddedAtUtc)
+                      .HasDefaultValueSql("datetime('now')");
+            });
+
+            // === MarketDataAsset Configuration ===
+            modelBuilder.Entity<MarketDataAsset>(entity =>
+            {
+                entity.ToTable("MarketDataAssets");
+
+                // Unique: one metadata row per symbol+interval pair
+                entity.HasIndex(a => new { a.Symbol, a.Interval })
+                      .IsUnique()
+                      .HasDatabaseName("IX_MarketDataAssets_Symbol_Interval");
+
+                entity.Property(a => a.ConsecutiveFailures)
+                      .HasDefaultValue(0);
+
+                entity.Property(a => a.RowsWritten)
+                      .HasDefaultValue(0);
+
+                entity.Property(a => a.UpdatedAtUtc)
                       .HasDefaultValueSql("datetime('now')");
             });
 

@@ -37,3 +37,19 @@ obj/
 # Python Caches
 __pycache__/
 *.pyc
+
+# --- Python Virtual Environment ---
+.venv/
+*.egg-info/
+*.pyo
+
+# --- Quant Engine Data Lake & Logs ---
+data_lake/
+logs/
+*.log
+
+# --- IDE / OS Artifacts ---
+.vs/
+.vscode/
+Thumbs.db
+.DS_Store

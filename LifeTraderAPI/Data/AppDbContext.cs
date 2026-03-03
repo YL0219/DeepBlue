@@ -216,7 +216,6 @@ namespace LifeTrader_AI.Data
                       .HasDefaultValueSql("datetime('now')");
             });
 
-            Console.WriteLine("[Backend] AppDbContext model configured.");
         }
     }
 }

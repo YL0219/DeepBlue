@@ -1,26 +1,22 @@
+// CONTRACT / INVARIANTS
+// - BackgroundService: runs a 5-minute ingestion loop for active symbols.
+// - Active symbols = portfolio holdings (IsOpen or Quantity > 0) UNION watchlist (IsActive).
+// - Each cycle creates a fresh DI scope (scoped DbContext). NEVER reuse DbContext across cycles.
+// - Batches of 10 symbols per PythonWorkerRunner invocation.
+// - Upserts MarketDataAsset metadata rows from the worker's IngestionReport.
+// - If Python is unavailable at startup, logs a warning and disables ingestion (does NOT crash).
+// - Parquet path contract: data_lake/market/ohlcv/symbol=<SYM>/interval=<INTERVAL>/latest.parquet
+
 using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 using LifeTrader_AI.Data;
 using LifeTrader_AI.Models;
+using LifeTrader_AI.Infrastructure;
 
 namespace LifeTrader_AI.Services.Ingestion
 {
     /// <summary>
-    /// BackgroundService that periodically ingests 1-year daily OHLCV data
-    /// for all ACTIVE symbols (portfolio holdings + watchlist).
-    ///
-    /// Each tick:
-    ///   1. Creates a DI scope (fresh DbContext)
-    ///   2. Queries active symbols via ActiveSymbolSource
-    ///   3. Chunks into batches of 10
-    ///   4. Runs PythonWorkerRunner per batch (writes Parquet, returns report)
-    ///   5. Upserts MarketDataAsset metadata rows from the report
-    ///
-    /// The Python worker writes heavy OHLCV data to Parquet on disk.
-    /// No candle arrays ever return to C# — only a small JSON report.
-    ///
-    /// Phase 4 Step 1.5: Resolves Python:ExePath from config at startup and
-    /// passes the absolute path to PythonWorkerRunner.
+    /// Periodically ingests 1-year daily OHLCV data for all active symbols.
     /// </summary>
     public class MarketIngestionOrchestrator : BackgroundService
     {
@@ -32,39 +28,40 @@ namespace LifeTrader_AI.Services.Ingestion
         private const string OutRoot = "data_lake/market/ohlcv";
 
         private readonly IServiceScopeFactory _scopeFactory;
-        private readonly SemaphoreSlim _pythonGate;
-        private readonly string _pythonExePath;
+        private readonly PythonPathResolver _pythonPath;
+        private readonly PythonWorkerRunner _runner;
+        private readonly ILogger<MarketIngestionOrchestrator> _logger;
 
         public MarketIngestionOrchestrator(
             IServiceScopeFactory scopeFactory,
             SemaphoreSlim pythonGate,
-            IConfiguration config,
-            IHostEnvironment env)
+            PythonPathResolver pythonPath,
+            ILogger<MarketIngestionOrchestrator> logger,
+            ILoggerFactory loggerFactory)
         {
             _scopeFactory = scopeFactory;
-            _pythonGate = pythonGate;
+            _pythonPath = pythonPath;
+            _logger = logger;
 
-            // Resolve Python:ExePath — relative paths anchored to ContentRootPath
-            var configPath = config["Python:ExePath"] ?? ".venv/Scripts/python.exe";
-            _pythonExePath = Path.IsPathRooted(configPath)
-                ? configPath
-                : Path.GetFullPath(Path.Combine(env.ContentRootPath, configPath));
+            // PythonWorkerRunner is stateless — safe to create once and reuse.
+            _runner = new PythonWorkerRunner(
+                pythonGate, pythonPath.ExePath,
+                loggerFactory.CreateLogger<PythonWorkerRunner>());
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            Console.WriteLine("[Ingestion] Market data ingestion service started.");
+            // If Python is not available, disable ingestion gracefully (don't crash the app).
+            if (!_pythonPath.IsAvailable)
+            {
+                _logger.LogWarning(
+                    "[Ingestion] Python not available at '{Path}'. " +
+                    "Ingestion service is DISABLED. API endpoints remain active. " +
+                    "Run setup_venv.ps1 to enable ingestion.", _pythonPath.ExePath);
+                return;
+            }
 
-            // Validate Python executable at startup
-            if (!File.Exists(_pythonExePath))
-            {
-                Console.WriteLine($"[Ingestion] WARNING: Python not found at '{_pythonExePath}'. " +
-                                  "Ingestion will fail until venv is created. Run: setup_venv.ps1");
-            }
-            else
-            {
-                Console.WriteLine($"[Ingestion] Using Python: {_pythonExePath}");
-            }
+            _logger.LogInformation("[Ingestion] Market data ingestion service started.");
 
             // Short delay so the app, DB migration, and WAL pragma all finish first
             try { await Task.Delay(StartupDelay, stoppingToken); }
@@ -82,23 +79,23 @@ namespace LifeTrader_AI.Services.Ingestion
 
         private async Task RunIngestionCycleAsync(CancellationToken ct)
         {
-            Console.WriteLine("[Ingestion] Starting ingestion cycle...");
+            _logger.LogInformation("[Ingestion] Starting ingestion cycle...");
 
             try
             {
                 using var scope = _scopeFactory.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
                 var symbolSource = new ActiveSymbolSource(db);
-                var runner = new PythonWorkerRunner(_pythonGate, _pythonExePath);
 
                 var symbols = await symbolSource.GetActiveSymbolsAsync(ct);
                 if (symbols.Count == 0)
                 {
-                    Console.WriteLine("[Ingestion] No active symbols to ingest. Skipping.");
+                    _logger.LogInformation("[Ingestion] No active symbols to ingest. Skipping.");
                     return;
                 }
 
-                Console.WriteLine($"[Ingestion] Active symbols ({symbols.Count}): {string.Join(", ", symbols)}");
+                _logger.LogInformation("[Ingestion] Active symbols ({Count}): {Symbols}",
+                    symbols.Count, string.Join(", ", symbols));
 
                 // Chunk into batches of BatchSize
                 var batches = symbols.Chunk(BatchSize).ToList();
@@ -107,15 +104,16 @@ namespace LifeTrader_AI.Services.Ingestion
                 {
                     ct.ThrowIfCancellationRequested();
                     var batch = batches[i];
-                    Console.WriteLine($"[Ingestion] Processing batch {i + 1}/{batches.Count}: {string.Join(", ", batch)}");
+                    _logger.LogInformation("[Ingestion] Processing batch {Current}/{Total}: {Symbols}",
+                        i + 1, batches.Count, string.Join(", ", batch));
 
-                    var report = await runner.RunMarketIngestAsync(
+                    var report = await _runner.RunMarketIngestAsync(
                         batch.ToList(), DefaultInterval, LookbackDays, OutRoot, ct);
 
                     if (report == null)
                     {
                         // Worker failed entirely — increment failures for all symbols in batch
-                        Console.WriteLine("[Ingestion] Worker returned null report. Marking batch as failed.");
+                        _logger.LogWarning("[Ingestion] Worker returned null report. Marking batch as failed.");
                         foreach (var sym in batch)
                         {
                             await UpsertAssetFailureAsync(db, sym, DefaultInterval,
@@ -125,7 +123,8 @@ namespace LifeTrader_AI.Services.Ingestion
                         continue;
                     }
 
-                    Console.WriteLine($"[Ingestion] Report received: jobId={report.JobId}, duration={report.DurationMs}ms, results={report.Results.Count}");
+                    _logger.LogInformation("[Ingestion] Report received: jobId={JobId}, duration={Duration}ms, results={Count}",
+                        report.JobId, report.DurationMs, report.Results.Count);
 
                     // Upsert MarketDataAsset for each result
                     foreach (var result in report.Results)
@@ -158,13 +157,15 @@ namespace LifeTrader_AI.Services.Ingestion
                                 asset.LastDataEndUtc = dataEnd;
                             }
 
-                            Console.WriteLine($"[Ingestion]   {result.Symbol}: OK via {result.ProviderUsed} ({result.RowsWritten} rows -> {result.ParquetPath})");
+                            _logger.LogInformation("[Ingestion]   {Symbol}: OK via {Provider} ({Rows} rows -> {Path})",
+                                result.Symbol, result.ProviderUsed, result.RowsWritten, result.ParquetPath);
                         }
                         else
                         {
                             asset.ConsecutiveFailures++;
                             asset.LastError = result.Error?.Message ?? "Unknown error";
-                            Console.WriteLine($"[Ingestion]   {result.Symbol}: FAIL ({asset.ConsecutiveFailures}x) — {asset.LastError}");
+                            _logger.LogWarning("[Ingestion]   {Symbol}: FAIL ({Failures}x) - {Error}",
+                                result.Symbol, asset.ConsecutiveFailures, asset.LastError);
                         }
 
                         asset.UpdatedAtUtc = DateTime.UtcNow;
@@ -176,19 +177,19 @@ namespace LifeTrader_AI.Services.Ingestion
                     if (report.Warnings.Count > 0)
                     {
                         foreach (var w in report.Warnings)
-                            Console.WriteLine($"[Ingestion] WARNING: {w}");
+                            _logger.LogWarning("[Ingestion] Worker warning: {Warning}", w);
                     }
                 }
 
-                Console.WriteLine("[Ingestion] Cycle complete.");
+                _logger.LogInformation("[Ingestion] Cycle complete.");
             }
             catch (OperationCanceledException)
             {
-                Console.WriteLine("[Ingestion] Cycle cancelled (shutting down).");
+                _logger.LogInformation("[Ingestion] Cycle cancelled (shutting down).");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Ingestion] Cycle failed: {ex.Message}");
+                _logger.LogError(ex, "[Ingestion] Cycle failed.");
             }
         }
 

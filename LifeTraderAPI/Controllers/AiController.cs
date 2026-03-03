@@ -1,3 +1,15 @@
+// CONTRACT / INVARIANTS
+// - Route: POST /api/ai/ask
+// - AI agent loop: sends user message to OpenAI, dispatches tool calls, returns response.
+// - Response shape: { response, uiActions, terminatedByCircuitBreaker, iterations }
+// - Read-only tools (fetch_market_data, open_chart) run in PARALLEL via Task.WhenAll.
+// - State-changing tools (execute_trade) run SERIALLY, max 1 per turn.
+// - Each tool task gets an ISOLATED DI scope (fresh DbContext). NEVER share DbContext across threads.
+// - history and uiActions are NEVER mutated inside parallel tasks — merged on main thread only.
+// - ToolRuns persisted in a single batch SaveChanges per turn for observability.
+// - Circuit breaker: max 10 iterations per request to prevent runaway token consumption.
+// - Symbols validated via SymbolValidator before any external call or Python arg.
+
 using Microsoft.AspNetCore.Mvc;
 using System.Text;
 using System.Text.Json;
@@ -7,251 +19,10 @@ using Microsoft.Extensions.Caching.Memory;
 using LifeTrader_AI.Data;
 using LifeTrader_AI.Models;
 using LifeTrader_AI.Services;
+using LifeTrader_AI.Infrastructure;
 
 namespace LifeTraderAPI.Controllers
 {
-    // ====================================================================
-    // MARKET DATA CONTROLLER — Serves candle/quote data for the chart web app
-    // ====================================================================
-    [ApiController]
-    [Route("api/market")]
-    public class MarketController : ControllerBase
-    {
-        // Strict allowlists for parameter validation
-        private static readonly HashSet<string> AllowedTimeframes = new(StringComparer.OrdinalIgnoreCase)
-            { "1m", "5m", "15m", "1h", "1d", "1w", "1mo" };
-
-        private static readonly HashSet<string> AllowedRanges = new(StringComparer.OrdinalIgnoreCase)
-            { "7d", "30d", "90d", "180d", "1y", "2y" };
-
-        private const int DefaultLimit = 500;
-        private const int MaxLimit = 2000;
-        private const int PythonTimeoutMs = 30_000;
-
-        // Regex: 1-10 uppercase letters/digits (stock tickers)
-        private static readonly System.Text.RegularExpressions.Regex SymbolRegex =
-            new(@"^[A-Z0-9]{1,10}$", System.Text.RegularExpressions.RegexOptions.Compiled);
-
-        private readonly IMemoryCache _cache;
-        private readonly SemaphoreSlim _pythonGate;
-
-        public MarketController(IMemoryCache cache, SemaphoreSlim pythonGate)
-        {
-            _cache = cache;
-            _pythonGate = pythonGate;
-        }
-
-
-        // GET /api/market/quote?symbol=AMD
-        [HttpGet("quote")]
-        public async Task<IActionResult> GetQuote([FromQuery] string symbol)
-        {
-            if (string.IsNullOrWhiteSpace(symbol) || !SymbolRegex.IsMatch(symbol.ToUpperInvariant()))
-                return BadRequest(new { error = "Invalid symbol. Must be 1-10 uppercase alphanumeric characters." });
-
-            symbol = symbol.ToUpperInvariant();
-
-            // Check cache first
-            string cacheKey = $"quote:{symbol}";
-            if (_cache.TryGetValue(cacheKey, out object? cachedQuote))
-            {
-                Console.WriteLine($"[Market API] Cache hit for {cacheKey}");
-                return Ok(cachedQuote);
-            }
-
-            Console.WriteLine($"[Market API] Quote request for {symbol}");
-
-            var (success, json, errorMsg) = await RunPythonFetcher($"quote --symbol {symbol}");
-            if (!success)
-                return StatusCode(502, new { error = errorMsg });
-
-            try
-            {
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-
-                if (!root.TryGetProperty("ok", out var okProp) || !okProp.GetBoolean())
-                {
-                    string pyError = root.TryGetProperty("error", out var errProp) ? errProp.GetString() ?? "Unknown" : "Unknown";
-                    return StatusCode(502, new { error = pyError });
-                }
-
-                var result = new
-                {
-                    symbol = root.GetProperty("symbol").GetString(),
-                    price = root.GetProperty("price").GetDouble(),
-                    timestampUtc = root.GetProperty("timestampUtc").GetString()
-                };
-
-                // Cache successful quote for 10 seconds
-                _cache.Set(cacheKey, result, TimeSpan.FromSeconds(10));
-                return Ok(result);
-            }
-            catch (JsonException ex)
-            {
-                Console.WriteLine($"[Market API] JSON parse error: {ex.Message}");
-                return StatusCode(502, new { error = "Invalid response from data fetcher." });
-            }
-        }
-
-
-        // GET /api/market/candles?symbol=AMD&tf=1d&range=180d&limit=500&to=optional
-        [HttpGet("candles")]
-        public async Task<IActionResult> GetCandles(
-            [FromQuery] string symbol,
-            [FromQuery] string tf = "1d",
-            [FromQuery] string range = "180d",
-            [FromQuery] int limit = DefaultLimit,
-            [FromQuery] string? to = null)
-        {
-            // Validate symbol
-            if (string.IsNullOrWhiteSpace(symbol) || !SymbolRegex.IsMatch(symbol.ToUpperInvariant()))
-                return BadRequest(new { error = "Invalid symbol." });
-
-            symbol = symbol.ToUpperInvariant();
-            tf = tf.ToLowerInvariant();
-            range = range.ToLowerInvariant();
-
-            // Validate timeframe
-            if (!AllowedTimeframes.Contains(tf))
-                return BadRequest(new { error = $"Invalid timeframe '{tf}'. Allowed: {string.Join(", ", AllowedTimeframes)}" });
-
-            // Validate range
-            if (!AllowedRanges.Contains(range))
-                return BadRequest(new { error = $"Invalid range '{range}'. Allowed: {string.Join(", ", AllowedRanges)}" });
-
-            // Clamp limit
-            limit = Math.Clamp(limit, 1, MaxLimit);
-
-            // Validate 'to' if provided (must be numeric unix timestamp)
-            if (to != null && !double.TryParse(to, out _))
-                return BadRequest(new { error = "Invalid 'to' parameter. Must be a unix timestamp." });
-
-            // Check cache first
-            string cacheKey = $"candles:{symbol}:{tf}:{range}:{limit}:{to ?? "latest"}";
-            if (_cache.TryGetValue(cacheKey, out object? cachedCandles))
-            {
-                Console.WriteLine($"[Market API] Cache hit for {cacheKey}");
-                return Ok(cachedCandles);
-            }
-
-            Console.WriteLine($"[Market API] Candles request: {symbol} tf={tf} range={range} limit={limit} to={to ?? "latest"}");
-
-            // Build python args
-            var args = $"candles --symbol {symbol} --tf {tf} --range {range} --limit {limit}";
-            if (to != null) args += $" --to {to}";
-
-            var (success, json, errorMsg) = await RunPythonFetcher(args);
-            if (!success)
-                return StatusCode(502, new { error = errorMsg });
-
-            try
-            {
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-
-                if (!root.TryGetProperty("ok", out var okProp) || !okProp.GetBoolean())
-                {
-                    string pyError = root.TryGetProperty("error", out var errProp) ? errProp.GetString() ?? "Unknown" : "Unknown";
-                    return StatusCode(502, new { error = pyError });
-                }
-
-                // Pass through the structured response
-                var result = new
-                {
-                    symbol = root.GetProperty("symbol").GetString(),
-                    tf = root.GetProperty("tf").GetString(),
-                    candles = root.GetProperty("candles").Clone(),
-                    nextTo = root.TryGetProperty("nextTo", out var ntProp) && ntProp.ValueKind != JsonValueKind.Null
-                        ? ntProp.GetInt64() : (long?)null
-                };
-
-                // Cache successful candles for 10 seconds
-                _cache.Set(cacheKey, result, TimeSpan.FromSeconds(10));
-                return Ok(result);
-            }
-            catch (JsonException ex)
-            {
-                Console.WriteLine($"[Market API] JSON parse error: {ex.Message}");
-                return StatusCode(502, new { error = "Invalid response from data fetcher." });
-            }
-        }
-
-
-        /// <summary>
-        /// Runs fetchmarketdata.py with the given arguments.
-        /// Gated by SemaphoreSlim to limit concurrent python processes.
-        /// Drains both stdout and stderr to avoid deadlocks. Has a timeout.
-        /// </summary>
-        private async Task<(bool Success, string StdOut, string Error)> RunPythonFetcher(string arguments)
-        {
-            await _pythonGate.WaitAsync();
-            try
-            {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "python",
-                    Arguments = $"fetchmarketdata.py {arguments}",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-
-                try
-                {
-                    using var process = Process.Start(psi);
-                    if (process == null)
-                        return (false, "", "Failed to start Python process.");
-
-                    // Drain stdout and stderr concurrently to prevent deadlocks
-                    var stdoutTask = process.StandardOutput.ReadToEndAsync();
-                    var stderrTask = process.StandardError.ReadToEndAsync();
-
-                    using var cts = new CancellationTokenSource(PythonTimeoutMs);
-                    try
-                    {
-                        await process.WaitForExitAsync(cts.Token);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        try { process.Kill(entireProcessTree: true); } catch { }
-                        return (false, "", "Python process timed out.");
-                    }
-
-                    string stdout = await stdoutTask;
-                    string stderr = await stderrTask;
-
-                    if (process.ExitCode != 0)
-                    {
-                        Console.WriteLine($"[Market API] Python stderr: {stderr}");
-                        return (false, "", $"Python exited with code {process.ExitCode}: {stderr}");
-                    }
-
-                    if (string.IsNullOrWhiteSpace(stdout))
-                        return (false, "", "Python returned empty output.");
-
-                    return (true, stdout.Trim(), "");
-                }
-                catch (Exception ex)
-                {
-                    return (false, "", $"Process error: {ex.Message}");
-                }
-            }
-            finally
-            {
-                _pythonGate.Release();
-            }
-        }
-    }
-
-
-    // ====================================================================
-    // AI CONTROLLER — The AI Brain (with uiActions + open_chart tool)
-    // Phase 3: Circuit breaker, ToolRun observability, process throttle, caching
-    // Optimization: Read-only tools execute in parallel via Task.WhenAll;
-    //               state-changing tools (execute_trade) run serially after reads.
-    // ====================================================================
     [ApiController]
     [Route("api/ai")]
     public class AiController : ControllerBase
@@ -262,6 +33,7 @@ namespace LifeTraderAPI.Controllers
         private const int MAX_PARALLEL_TOOL_TASKS = 4;    // Concurrent read-only tool task cap per turn
         private const int MAX_STATE_CHANGING_PER_TURN = 1; // Only 1 write tool per turn
         private const int PythonTimeoutMs = 20_000;        // Hard timeout for python processes
+        private const int CurlTimeoutMs = 15_000;          // Hard timeout for curl (Finnhub)
 
         // Tools that mutate state — serialized, limited to 1 per AI turn.
         // All other tools are treated as read-only and safe to parallelize.
@@ -278,6 +50,8 @@ namespace LifeTraderAPI.Controllers
         private readonly SemaphoreSlim _pythonGate;
         private readonly IMemoryCache _cache;
         private readonly IServiceScopeFactory _scopeFactory;
+        private readonly PythonPathResolver _pythonPath;
+        private readonly ILogger<AiController> _logger;
 
         // --- Internal DTOs for parallel tool execution ---
 
@@ -300,15 +74,20 @@ namespace LifeTraderAPI.Controllers
             IConfiguration config,
             SemaphoreSlim pythonGate,
             IMemoryCache cache,
-            IServiceScopeFactory scopeFactory)
+            IServiceScopeFactory scopeFactory,
+            PythonPathResolver pythonPath,
+            ILogger<AiController> logger)
         {
             _db = db;
             _config = config;
             _pythonGate = pythonGate;
             _cache = cache;
             _scopeFactory = scopeFactory;
+            _pythonPath = pythonPath;
+            _logger = logger;
 
-            // Read keys from configuration (appsettings.json / env vars)
+            // TODO: Migrate API keys to user-secrets or environment variables (separate task).
+            // Keys in appsettings.json is a security risk in shared/production environments.
             string apiKey = _config["OpenAI:ApiKey"] ?? "";
             if (!client.DefaultRequestHeaders.Contains("Authorization") && !string.IsNullOrEmpty(apiKey))
             {
@@ -339,7 +118,7 @@ namespace LifeTraderAPI.Controllers
         [HttpPost("ask")]
         public async Task<IActionResult> AskTheAgent([FromBody] ChatRequest request, CancellationToken ct)
         {
-            Console.WriteLine($"\n[Server] Unity asked: {request.Message}");
+            _logger.LogInformation("[AI] Request received: {Message}", request.Message);
             string threadId = !string.IsNullOrWhiteSpace(request.ThreadId) ? request.ThreadId : "default-user-session";
 
             // Load memory from the SQLite Database
@@ -358,7 +137,8 @@ namespace LifeTraderAPI.Controllers
             var (aiResponse, uiActions, terminatedByCircuitBreaker, iterations) =
                 await RunAutonomousAgent(messageHistory, request.Message, threadId, ct);
 
-            Console.WriteLine($"[Server] Sending answer back to Unity... (iterations={iterations}, circuitBreaker={terminatedByCircuitBreaker})");
+            _logger.LogInformation("[AI] Response sent (iterations={Iterations}, circuitBreaker={CircuitBreaker})",
+                iterations, terminatedByCircuitBreaker);
             return Ok(new
             {
                 response = aiResponse,
@@ -447,9 +227,7 @@ namespace LifeTraderAPI.Controllers
                 if (iteration > MAX_AGENT_ITERATIONS)
                 {
                     string warningMsg = $"[Circuit Breaker] Agent terminated after {MAX_AGENT_ITERATIONS} iterations to prevent runaway token consumption.";
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"[Agent Engine] {warningMsg}");
-                    Console.ResetColor();
+                    _logger.LogWarning("[AI] {Warning}", warningMsg);
 
                     // Persist warning to chat history
                     _db.ChatMessages.Add(new ChatMessage
@@ -460,7 +238,6 @@ namespace LifeTraderAPI.Controllers
                     });
                     await _db.SaveChangesAsync(ct);
 
-                    // Build safe response: include last assistant content if available
                     string safeResponse = string.IsNullOrEmpty(finalAiResponse)
                         ? warningMsg
                         : $"{finalAiResponse}\n\n{warningMsg}";
@@ -487,10 +264,10 @@ namespace LifeTraderAPI.Controllers
                         if (finishReason == "tool_calls")
                         {
                             int toolCount = message.GetProperty("tool_calls").GetArrayLength();
-                            Console.WriteLine($"\n[Agent Engine] AI requested {toolCount} tool(s) in a single breath! (iteration {iteration}/{MAX_AGENT_ITERATIONS})");
+                            _logger.LogInformation("[AI] AI requested {ToolCount} tool(s) (iteration {Iter}/{Max})",
+                                toolCount, iteration, MAX_AGENT_ITERATIONS);
 
                             // Step 1: Append the assistant message with tool_calls to history
-                            // (OpenAI expects this before the tool role messages)
                             history.Add(new
                             {
                                 role = "assistant",
@@ -518,17 +295,17 @@ namespace LifeTraderAPI.Controllers
                             var readOnlyCalls = activeCalls.Where(c => !IsStateChangingTool(c.ToolName)).ToList();
                             var writeCalls = activeCalls.Where(c => IsStateChangingTool(c.ToolName)).ToList();
 
-                            // Step 5: Enforce MAX_STATE_CHANGING_PER_TURN — keep first, reject rest
+                            // Step 5: Enforce MAX_STATE_CHANGING_PER_TURN
                             ToolCallInfo? allowedWrite = writeCalls.FirstOrDefault();
                             var rejectedWrites = writeCalls.Skip(MAX_STATE_CHANGING_PER_TURN).ToList();
 
-                            // Collect all results here; merged into history/uiActions after all tasks complete
                             var allResults = new List<ToolExecResult>();
 
-                            // Log rejected overflow calls (still need tool role messages for OpenAI)
+                            // Log rejected overflow calls
                             foreach (var oc in overflowCalls)
                             {
-                                Console.WriteLine($"[Agent Engine] OVERFLOW: tool '{oc.ToolName}' rejected (>{MAX_TOOLS_PER_TURN} per turn).");
+                                _logger.LogWarning("[AI] Overflow: tool '{ToolName}' rejected (>{Max} per turn).",
+                                    oc.ToolName, MAX_TOOLS_PER_TURN);
                                 allResults.Add(MakeWarningResult(oc,
                                     $"SYSTEM WARNING: max {MAX_TOOLS_PER_TURN} tool calls per turn exceeded; this call was ignored.", threadId));
                             }
@@ -536,21 +313,14 @@ namespace LifeTraderAPI.Controllers
                             // Log rejected duplicate state-changing calls
                             foreach (var rw in rejectedWrites)
                             {
-                                Console.WriteLine($"[Agent Engine] POLICY: duplicate state-changing tool '{rw.ToolName}' rejected.");
+                                _logger.LogWarning("[AI] Policy: duplicate state-changing tool '{ToolName}' rejected.", rw.ToolName);
                                 allResults.Add(MakeWarningResult(rw,
                                     "SYSTEM WARNING: multiple state-changing tools requested in one turn; only the first execute_trade is allowed.", threadId));
                             }
 
                             // Step 6: Execute read-only tools in PARALLEL with bounded concurrency.
-                            //   - Each task gets its own DI scope so it never shares the controller's
-                            //     scoped DbContext across threads (EF Core is NOT thread-safe).
-                            //   - Singletons (IMemoryCache, SemaphoreSlim python gate) resolve to
-                            //     the same instance inside the scope — safe for concurrent access.
-                            //   - history and uiActions are NEVER mutated inside tasks;
-                            //     each task returns a ToolExecResult that is merged afterwards.
                             if (readOnlyCalls.Count > 0)
                             {
-                                // Local semaphore caps parallel tool tasks this turn (separate from python gate)
                                 using var toolGate = new SemaphoreSlim(MAX_PARALLEL_TOOL_TASKS, MAX_PARALLEL_TOOL_TASKS);
 
                                 var readTasks = readOnlyCalls.Select(async call =>
@@ -564,24 +334,20 @@ namespace LifeTraderAPI.Controllers
                                     {
                                         toolGate.Release();
                                     }
-                                }).ToList(); // .ToList() eagerly starts all tasks
+                                }).ToList();
 
                                 var readResults = await Task.WhenAll(readTasks);
                                 allResults.AddRange(readResults);
                             }
 
                             // Step 7: Execute the single allowed state-changing tool SERIALLY after reads.
-                            //   execute_trade is never run concurrently with another write in the same turn.
-                            //   It uses its own DI scope (fresh DbContext + TradingService).
                             if (allowedWrite != null)
                             {
                                 var writeResult = await ExecuteToolInIsolatedScopeAsync(allowedWrite, threadId, finnhubKey, ct);
                                 allResults.Add(writeResult);
                             }
 
-                            // Step 8: Sort by original tool_calls index and merge into shared state.
-                            //   OpenAI expects tool role messages in the same order as tool_calls.
-                            //   This merge happens on the main thread — no concurrency concerns.
+                            // Step 8: Sort by original index and merge into shared state.
                             allResults.Sort((a, b) => a.Index.CompareTo(b.Index));
 
                             foreach (var r in allResults)
@@ -596,9 +362,7 @@ namespace LifeTraderAPI.Controllers
                                 uiActions.AddRange(r.UiActionsLocal);
                             }
 
-                            // Step 9: Persist all ToolRuns in a single batch using the controller-scoped
-                            //   DbContext. This avoids SQLite writer contention from parallel saves and
-                            //   guarantees one atomic SaveChanges for all observability rows this turn.
+                            // Step 9: Persist all ToolRuns in a single batch.
                             try
                             {
                                 foreach (var r in allResults)
@@ -619,7 +383,7 @@ namespace LifeTraderAPI.Controllers
                             }
                             catch (Exception logEx)
                             {
-                                Console.WriteLine($"[Agent Engine] Failed to batch-log ToolRuns: {logEx.Message}");
+                                _logger.LogError(logEx, "[AI] Failed to batch-log ToolRuns.");
                             }
                         }
                         else
@@ -627,7 +391,6 @@ namespace LifeTraderAPI.Controllers
                             finalAiResponse = message.GetProperty("content").GetString() ?? "";
                             history.Add(new { role = "assistant", content = finalAiResponse });
 
-                            // Save AI response to DB
                             _db.ChatMessages.Add(new ChatMessage { ThreadId = threadId, Role = "assistant", Content = finalAiResponse });
                             await _db.SaveChangesAsync(ct);
 
@@ -648,23 +411,14 @@ namespace LifeTraderAPI.Controllers
         // ================================================================
         // 4. ISOLATED TOOL EXECUTION — One DI scope per tool call
         //
-        //    WHY a fresh scope? EF Core's DbContext is NOT thread-safe.
-        //    Parallel read-only tasks would corrupt the controller's shared
-        //    DbContext if they resolved scoped services from it. Each scope
-        //    provides an independent DbContext + TradingService instance.
-        //    Singletons (IMemoryCache, SemaphoreSlim) resolve to the same
-        //    instance — safe by design for concurrent access.
-        //
-        //    The method returns a ToolExecResult instead of mutating any
-        //    shared collection (history, uiActions). The caller merges
-        //    results on the main thread after all tasks complete.
+        //    Each scope provides an independent DbContext + TradingService.
+        //    Singletons (IMemoryCache, SemaphoreSlim) resolve to the same instance — safe.
+        //    Returns a ToolExecResult; the caller merges results on the main thread.
         // ================================================================
         private async Task<ToolExecResult> ExecuteToolInIsolatedScopeAsync(
             ToolCallInfo call, string threadId, string finnhubKey, CancellationToken ct)
         {
-            Console.ForegroundColor = ConsoleColor.Magenta;
-            Console.WriteLine($"[Agent Engine] Executing Tool: {call.ToolName} (idx={call.Index})...");
-            Console.ResetColor();
+            _logger.LogInformation("[AI] Executing tool: {ToolName} (idx={Index})", call.ToolName, call.Index);
 
             var sw = Stopwatch.StartNew();
             string toolResult = "";
@@ -679,24 +433,28 @@ namespace LifeTraderAPI.Controllers
                     case "fetch_market_data":
                         {
                             using var argDoc = JsonDocument.Parse(call.ArgumentsJson);
-                            string symbol = argDoc.RootElement.GetProperty("symbol").GetString() ?? "";
-                            string upperSymbol = symbol.ToUpperInvariant();
+                            string rawSymbol = argDoc.RootElement.GetProperty("symbol").GetString() ?? "";
+
+                            if (!SymbolValidator.TryNormalize(rawSymbol, out var symbol))
+                            {
+                                toolResult = "ERROR: Invalid symbol format. Must be 1-15 alphanumeric characters.";
+                                break;
+                            }
 
                             // Check cache first (10s TTL). IMemoryCache is singleton — thread-safe.
-                            string cacheKey = $"quote:{upperSymbol}";
+                            string cacheKey = $"quote:{symbol}";
                             string? cachedResult = _cache.Get<string>(cacheKey);
 
                             if (cachedResult != null)
                             {
                                 toolResult = cachedResult;
-                                Console.WriteLine($"[Agent Engine] Cache hit for {cacheKey}");
+                                _logger.LogDebug("[AI] Cache hit: {CacheKey}", cacheKey);
                             }
                             else
                             {
-                                var data = await FetchMarketData(symbol, finnhubKey);
+                                var data = await FetchMarketData(symbol, finnhubKey, ct);
                                 toolResult = $"Price: {data.price}\nNews: {data.news}";
 
-                                // Only cache successful results (price starts with "$")
                                 if (data.price.StartsWith("$"))
                                 {
                                     _cache.Set(cacheKey, toolResult, TimeSpan.FromSeconds(10));
@@ -707,21 +465,25 @@ namespace LifeTraderAPI.Controllers
 
                     case "execute_trade":
                         {
-                            // Resolve scoped TradingService from the isolated scope.
-                            // This gives us a fresh DbContext that no other thread touches.
                             var tradingService = scope.ServiceProvider.GetRequiredService<TradingService>();
 
                             using var argDoc = JsonDocument.Parse(call.ArgumentsJson);
-                            string action = argDoc.RootElement.GetProperty("action").GetString() ?? "".ToLower();
-                            string symbol = argDoc.RootElement.GetProperty("symbol").GetString() ?? "".ToUpper();
+                            string action = (argDoc.RootElement.GetProperty("action").GetString() ?? "").ToLowerInvariant();
+                            string rawSymbol = argDoc.RootElement.GetProperty("symbol").GetString() ?? "";
                             int shares = argDoc.RootElement.GetProperty("shares").GetInt32();
                             decimal price = argDoc.RootElement.GetProperty("price").GetDecimal();
+
+                            if (!SymbolValidator.TryNormalize(rawSymbol, out var symbol))
+                            {
+                                toolResult = "ERROR: Invalid symbol format.";
+                                break;
+                            }
 
                             var tradeReq = new TradeRequest
                             {
                                 ClientRequestId = Guid.NewGuid().ToString(),
                                 Symbol = symbol,
-                                Side = action.ToUpper(),
+                                Side = action.ToUpperInvariant(),
                                 Quantity = shares,
                                 ExecutedPrice = price,
                                 Currency = "USD"
@@ -729,21 +491,23 @@ namespace LifeTraderAPI.Controllers
 
                             var result = await tradingService.ExecuteTradeAsync(tradeReq);
 
-                            if (result.Success)
-                            {
-                                toolResult = $"SUCCESS: {action.ToUpper()} {shares} shares of {symbol} at ${price}.";
-                            }
-                            else
-                            {
-                                toolResult = $"ERROR: {result.ErrorMessage}";
-                            }
+                            toolResult = result.Success
+                                ? $"SUCCESS: {action.ToUpperInvariant()} {shares} shares of {symbol} at ${price}."
+                                : $"ERROR: {result.ErrorMessage}";
                             break;
                         }
 
                     case "open_chart":
                         {
                             using var argDoc = JsonDocument.Parse(call.ArgumentsJson);
-                            string symbol = (argDoc.RootElement.GetProperty("symbol").GetString() ?? "AMD").ToUpperInvariant();
+                            string rawSymbol = argDoc.RootElement.GetProperty("symbol").GetString() ?? "AMD";
+
+                            if (!SymbolValidator.TryNormalize(rawSymbol, out var symbol))
+                            {
+                                toolResult = "ERROR: Invalid symbol format.";
+                                break;
+                            }
+
                             string tf = argDoc.RootElement.TryGetProperty("tf", out var tfProp)
                                 ? tfProp.GetString() ?? "1d" : "1d";
                             string range = argDoc.RootElement.TryGetProperty("range", out var rangeProp)
@@ -751,8 +515,6 @@ namespace LifeTraderAPI.Controllers
 
                             string chartUrl = $"/chart/index.html?symbol={symbol}&tf={tf}&range={range}";
 
-                            // UI action collected LOCALLY — merged into the shared list on main thread only.
-                            // Never write to shared uiActions from a parallel task.
                             localUiActions.Add(new
                             {
                                 type = "openChart",
@@ -763,7 +525,7 @@ namespace LifeTraderAPI.Controllers
                             });
 
                             toolResult = $"Chart opened for {symbol} tf={tf} range={range}";
-                            Console.WriteLine($"[Agent Engine] UI Action: openChart -> {chartUrl}");
+                            _logger.LogInformation("[AI] UI action: openChart -> {ChartUrl}", chartUrl);
                             break;
                         }
 
@@ -793,7 +555,8 @@ namespace LifeTraderAPI.Controllers
                 threadId, call.ToolName, call.ArgumentsJson, toolResult,
                 sw.ElapsedMilliseconds, isSuccess, DateTime.UtcNow);
 
-            Console.WriteLine($"[Agent Engine] Tool '{call.ToolName}' completed in {sw.ElapsedMilliseconds}ms (success={isSuccess})");
+            _logger.LogInformation("[AI] Tool '{ToolName}' completed in {Ms}ms (success={Success})",
+                call.ToolName, sw.ElapsedMilliseconds, isSuccess);
 
             return new ToolExecResult(call.Index, call.ToolCallId, call.ToolName,
                 toolResult, localUiActions, runPayload);
@@ -804,62 +567,48 @@ namespace LifeTraderAPI.Controllers
         // DATA SCRAPERS — Use only singletons (cache, python gate, config).
         //   Safe to call from parallel tasks because they never touch DbContext.
         // ====================================================================
-        private async Task<(string price, string news)> FetchMarketData(string symbol, string finnhubKey)
+        private async Task<(string price, string news)> FetchMarketData(
+            string symbol, string finnhubKey, CancellationToken ct)
         {
-            var priceTask = GetStockPrice(symbol, finnhubKey);
-            var newsTask = RunPythonHunter(symbol);
+            var priceTask = GetStockPrice(symbol, finnhubKey, ct);
+            var newsTask = RunPythonHunter(symbol, ct);
             await Task.WhenAll(priceTask, newsTask);
             return (priceTask.Result, newsTask.Result);
         }
 
-        private async Task<string> GetStockPrice(string symbol, string finnhubKey)
+        /// <summary>
+        /// Fetches the current stock price from Finnhub via curl.
+        /// Uses ProcessRunner with ArgumentList (injection-safe).
+        /// </summary>
+        private async Task<string> GetStockPrice(string symbol, string finnhubKey, CancellationToken ct)
         {
-            string url = $"https://finnhub.io/api/v1/quote?symbol={symbol.ToUpper()}&token={finnhubKey.Trim()}";
-            var processInfo = new ProcessStartInfo
-            {
-                FileName = "curl.exe",
-                Arguments = $"-k -s -S -L -4 --ssl-no-revoke --http1.1 --retry 3 --retry-delay 2 -H \"User-Agent: Mozilla/5.0\" \"{url}\"",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
+            string normalized = SymbolValidator.Normalize(symbol);
+            string url = $"https://finnhub.io/api/v1/quote?symbol={normalized}&token={finnhubKey.Trim()}";
+
+            var result = await ProcessRunner.RunAsync(
+                "curl.exe",
+                new[] { "-k", "-s", "-S", "-L", "-4", "--ssl-no-revoke", "--http1.1",
+                        "--retry", "3", "--retry-delay", "2",
+                        "-H", "User-Agent: Mozilla/5.0", url },
+                CurlTimeoutMs, ct);
+
+            if (result.TimedOut)
+                return "Error: Curl timed out.";
+
+            if (!result.Success || string.IsNullOrWhiteSpace(result.Stdout))
+                return "Error: Connection Failed.";
 
             try
             {
-                using (var process = Process.Start(processInfo))
+                using (JsonDocument doc = JsonDocument.Parse(result.Stdout))
                 {
-                    if (process == null) return "Error: Could not start Curl.";
-
-                    var stdoutTask = process.StandardOutput.ReadToEndAsync();
-                    var stderrTask = process.StandardError.ReadToEndAsync();
-
-                    using var cts = new CancellationTokenSource(15_000);
-                    try
+                    if (doc.RootElement.TryGetProperty("c", out JsonElement priceEl) && priceEl.ValueKind != JsonValueKind.Null)
                     {
-                        await process.WaitForExitAsync(cts.Token);
+                        double price = priceEl.GetDouble();
+                        if (price == 0) return "Error: Symbol not found.";
+                        return $"${price}";
                     }
-                    catch (OperationCanceledException)
-                    {
-                        try { process.Kill(entireProcessTree: true); } catch { }
-                        return "Error: Curl timed out.";
-                    }
-
-                    string json = await stdoutTask;
-                    await stderrTask; // drain stderr
-
-                    if (string.IsNullOrWhiteSpace(json)) return "Error: Connection Failed.";
-
-                    using (JsonDocument doc = JsonDocument.Parse(json))
-                    {
-                        if (doc.RootElement.TryGetProperty("c", out JsonElement priceEl) && priceEl.ValueKind != JsonValueKind.Null)
-                        {
-                            double price = priceEl.GetDouble();
-                            if (price == 0) return "Error: Symbol not found.";
-                            return $"${price}";
-                        }
-                        return "Error: Symbol not found.";
-                    }
+                    return "Error: Symbol not found.";
                 }
             }
             catch (Exception ex) { return $"SYSTEM ERROR: {ex.Message}"; }
@@ -867,67 +616,40 @@ namespace LifeTraderAPI.Controllers
 
         /// <summary>
         /// Runs fetch_news.py gated by SemaphoreSlim to limit concurrent python processes.
-        /// Hard timeout of 20 seconds; kills process on timeout.
+        /// Uses ProcessRunner with ArgumentList (injection-safe).
         /// The python gate is a singleton — concurrent calls from parallel tool tasks
         /// safely contend on the same semaphore (global cap of 3 python processes).
         /// </summary>
-        private async Task<string> RunPythonHunter(string symbol)
+        private async Task<string> RunPythonHunter(string symbol, CancellationToken ct)
         {
-            await _pythonGate.WaitAsync();
+            if (!_pythonPath.IsAvailable)
+                return "SYSTEM ERROR: Python not available. Run setup_venv.ps1.";
+
+            string normalized = SymbolValidator.Normalize(symbol);
+
+            await _pythonGate.WaitAsync(ct);
             try
             {
-                var pythonInfo = new ProcessStartInfo
-                {
-                    FileName = "python",
-                    Arguments = $"fetch_news.py {symbol}",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
+                var result = await ProcessRunner.RunAsync(
+                    _pythonPath.ExePath,
+                    new[] { "fetch_news.py", normalized },
+                    PythonTimeoutMs, ct);
 
-                try
-                {
-                    using (var process = Process.Start(pythonInfo))
-                    {
-                        if (process == null) return "Error: Could not start Python.";
+                if (result.TimedOut)
+                    return "SYSTEM ERROR: Python process timed out (20s).";
 
-                        // Drain stdout and stderr concurrently to prevent deadlocks
-                        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-                        var stderrTask = process.StandardError.ReadToEndAsync();
+                if (!result.Success)
+                    return string.IsNullOrWhiteSpace(result.Stderr)
+                        ? "No data returned."
+                        : $"SYSTEM ERROR: {result.Stderr}";
 
-                        using var cts = new CancellationTokenSource(PythonTimeoutMs);
-                        try
-                        {
-                            await process.WaitForExitAsync(cts.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            try { process.Kill(entireProcessTree: true); } catch { }
-                            return "SYSTEM ERROR: Python process timed out (20s).";
-                        }
-
-                        string output = await stdoutTask;
-                        await stderrTask; // drain stderr
-
-                        return string.IsNullOrWhiteSpace(output) ? "No data returned." : output;
-                    }
-                }
-                catch (Exception ex) { return $"SYSTEM ERROR: {ex.Message}"; }
+                return string.IsNullOrWhiteSpace(result.Stdout) ? "No data returned." : result.Stdout;
             }
+            catch (Exception ex) { return $"SYSTEM ERROR: {ex.Message}"; }
             finally
             {
                 _pythonGate.Release();
             }
         }
-    }
-
-    // ====================================================================
-    // REQUEST DTO
-    // ====================================================================
-    public class ChatRequest
-    {
-        public string Message { get; set; } = "";
-        public string? ThreadId { get; set; }
     }
 }

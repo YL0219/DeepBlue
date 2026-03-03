@@ -1,12 +1,20 @@
+// CONTRACT / INVARIANTS
+// - Handles trade execution with idempotency (ClientRequestId UNIQUE) and optimistic concurrency (RowVersion).
+// - Registered as Scoped in DI — shares the DbContext lifetime of the request/scope.
+// - Flow: fast dupe check -> begin txn -> re-check dupe -> insert Trade -> load/create Position -> update qty/price -> SaveChanges -> commit.
+// - RowVersion auto-incremented by AppDbContext.SaveChangesAsync override. EF Core adds WHERE RowVersion = @old.
+// - On DbUpdateConcurrencyException: detach all, retry up to 3x with exponential backoff.
+// - MUST NOT be called from multiple threads with the same DbContext instance.
+
 using Microsoft.EntityFrameworkCore;
 using LifeTrader_AI.Data;
 using LifeTrader_AI.Models;
 
 namespace LifeTrader_AI.Services
 {
-    // Alias inside namespace block: C# checks aliases here BEFORE
-    // checking the parent namespace, so this overrides LifeTrader_AI.Position (Portfolio.cs).
+    // Alias inside namespace block: overrides LifeTrader_AI.Position if ambiguous.
     using Position = LifeTrader_AI.Models.Position;
+
     // ====================================================================
     // REQUEST / RESULT DTOs
     // ====================================================================
@@ -60,26 +68,17 @@ namespace LifeTrader_AI.Services
     /// <summary>
     /// Handles trade execution with idempotency and optimistic concurrency.
     /// Registered as Scoped in Program.cs (shares the DbContext lifetime).
-    ///
-    /// Flow:
-    /// 1. Fast idempotency check (outside transaction).
-    /// 2. Begin transaction.
-    /// 3. Re-check idempotency (race condition guard).
-    /// 4. Insert Trade row.
-    /// 5. Load or create Position.
-    /// 6. Update Position quantity/price + auto-increment RowVersion.
-    /// 7. SaveChanges (WHERE RowVersion = @old fires here).
-    /// 8. If DbUpdateConcurrencyException → detach all, retry (up to 3x).
-    /// 9. Commit.
     /// </summary>
     public class TradingService
     {
         private readonly AppDbContext _db;
+        private readonly ILogger<TradingService> _logger;
         private const int MaxRetries = 3;
 
-        public TradingService(AppDbContext db)
+        public TradingService(AppDbContext db, ILogger<TradingService> logger)
         {
             _db = db;
+            _logger = logger;
         }
 
         public async Task<TradeResult> ExecuteTradeAsync(TradeRequest request)
@@ -91,7 +90,7 @@ namespace LifeTrader_AI.Services
 
             if (existingTrade != null)
             {
-                Console.WriteLine($"[Backend] Duplicate trade detected: {request.ClientRequestId}");
+                _logger.LogInformation("[Trade] Duplicate detected: {RequestId}", request.ClientRequestId);
                 return TradeResult.Duplicate(existingTrade);
             }
 
@@ -105,7 +104,8 @@ namespace LifeTrader_AI.Services
                     {
                         entry.State = EntityState.Detached;
                     }
-                    Console.WriteLine($"[Backend] Retrying trade (attempt {attempt}/{MaxRetries}): {request.ClientRequestId}");
+                    _logger.LogWarning("[Trade] Retrying (attempt {Attempt}/{Max}): {RequestId}",
+                        attempt, MaxRetries, request.ClientRequestId);
                 }
 
                 using var transaction = await _db.Database.BeginTransactionAsync();
@@ -119,7 +119,7 @@ namespace LifeTrader_AI.Services
                     if (duplicateCheck != null)
                     {
                         await transaction.RollbackAsync();
-                        Console.WriteLine($"[Backend] Duplicate caught inside transaction: {request.ClientRequestId}");
+                        _logger.LogInformation("[Trade] Duplicate caught inside transaction: {RequestId}", request.ClientRequestId);
                         return TradeResult.Duplicate(duplicateCheck);
                     }
 
@@ -201,17 +201,17 @@ namespace LifeTrader_AI.Services
                     _db.Trades.Add(trade);
 
                     // SaveChangesAsync auto-increments RowVersion via AppDbContext override.
-                    // EF Core generates: UPDATE ... WHERE Id = @id AND RowVersion = @old
                     await _db.SaveChangesAsync();
                     await transaction.CommitAsync();
 
-                    Console.WriteLine($"[Backend] Trade executed: {trade.Side} {trade.Quantity} {trade.Symbol} @ {trade.ExecutedPrice}");
+                    _logger.LogInformation("[Trade] Executed: {Side} {Quantity} {Symbol} @ {Price}",
+                        trade.Side, trade.Quantity, trade.Symbol, trade.ExecutedPrice);
                     return TradeResult.Ok(trade);
                 }
                 catch (DbUpdateConcurrencyException)
                 {
                     await transaction.RollbackAsync();
-                    Console.WriteLine($"[Backend] Concurrency conflict on attempt {attempt}/{MaxRetries}");
+                    _logger.LogWarning("[Trade] Concurrency conflict (attempt {Attempt}/{Max})", attempt, MaxRetries);
 
                     if (attempt == MaxRetries)
                     {
@@ -227,7 +227,6 @@ namespace LifeTrader_AI.Services
                     ex.InnerException.Message.Contains("ClientRequestId"))
                 {
                     // Race condition: another thread inserted the same ClientRequestId
-                    // between our check and our insert. The UNIQUE constraint caught it.
                     await transaction.RollbackAsync();
 
                     foreach (var entry in _db.ChangeTracker.Entries().ToList())
@@ -239,7 +238,7 @@ namespace LifeTrader_AI.Services
 
                     if (raceDuplicate != null)
                     {
-                        Console.WriteLine($"[Backend] Race-condition duplicate resolved: {request.ClientRequestId}");
+                        _logger.LogInformation("[Trade] Race-condition duplicate resolved: {RequestId}", request.ClientRequestId);
                         return TradeResult.Duplicate(raceDuplicate);
                     }
 
@@ -248,7 +247,7 @@ namespace LifeTrader_AI.Services
                 catch (Exception ex)
                 {
                     await transaction.RollbackAsync();
-                    Console.WriteLine($"[Backend] Trade execution error: {ex.Message}");
+                    _logger.LogError(ex, "[Trade] Execution error.");
                     return TradeResult.Failure($"Unexpected error: {ex.Message}");
                 }
             }

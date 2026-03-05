@@ -152,7 +152,11 @@ def cmd_candles(args):
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main(argv=None):
+    """
+    Entry point for router integration. Called by python_router.py or directly.
+    argv: list of CLI args (without script name). None = use sys.argv[1:].
+    """
     parser = argparse.ArgumentParser(description="Deep Blue Market Data Fetcher")
     subparsers = parser.add_subparsers(dest="command")
 
@@ -168,7 +172,7 @@ if __name__ == "__main__":
     candles_parser.add_argument("--limit", default="500")
     candles_parser.add_argument("--to", default=None)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.command == "quote":
         cmd_quote(args)
@@ -176,3 +180,7 @@ if __name__ == "__main__":
         cmd_candles(args)
     else:
         error_json("Unknown command. Use 'quote' or 'candles'.")
+
+
+if __name__ == "__main__":
+    main()

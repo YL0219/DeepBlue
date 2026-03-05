@@ -12,6 +12,7 @@ using Microsoft.EntityFrameworkCore;
 using LifeTrader_AI.Data;
 using LifeTrader_AI.Models;
 using LifeTrader_AI.Infrastructure;
+using LifeTrader_AI.Infrastructure.Python;
 
 namespace LifeTrader_AI.Services.Ingestion
 {
@@ -28,36 +29,35 @@ namespace LifeTrader_AI.Services.Ingestion
         private const string OutRoot = "data_lake/market/ohlcv";
 
         private readonly IServiceScopeFactory _scopeFactory;
-        private readonly PythonPathResolver _pythonPath;
+        private readonly PythonDispatcherService _dispatcher;
         private readonly PythonWorkerRunner _runner;
         private readonly ILogger<MarketIngestionOrchestrator> _logger;
 
         public MarketIngestionOrchestrator(
             IServiceScopeFactory scopeFactory,
-            SemaphoreSlim pythonGate,
-            PythonPathResolver pythonPath,
+            PythonDispatcherService dispatcher,
             ILogger<MarketIngestionOrchestrator> logger,
             ILoggerFactory loggerFactory)
         {
             _scopeFactory = scopeFactory;
-            _pythonPath = pythonPath;
+            _dispatcher = dispatcher;
             _logger = logger;
 
             // PythonWorkerRunner is stateless — safe to create once and reuse.
             _runner = new PythonWorkerRunner(
-                pythonGate, pythonPath.ExePath,
+                dispatcher,
                 loggerFactory.CreateLogger<PythonWorkerRunner>());
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             // If Python is not available, disable ingestion gracefully (don't crash the app).
-            if (!_pythonPath.IsAvailable)
+            if (!_dispatcher.IsAvailable)
             {
                 _logger.LogWarning(
-                    "[Ingestion] Python not available at '{Path}'. " +
+                    "[Ingestion] Python not available. " +
                     "Ingestion service is DISABLED. API endpoints remain active. " +
-                    "Run setup_venv.ps1 to enable ingestion.", _pythonPath.ExePath);
+                    "Run setup_venv.ps1 to enable ingestion.");
                 return;
             }
 

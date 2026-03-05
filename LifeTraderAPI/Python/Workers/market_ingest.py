@@ -1,8 +1,8 @@
 """
-market_ingest_worker.py — Batch OHLCV ingestion for Deep Blue (Phase 4 Step 1.5).
+market_ingest.py — Modular OHLCV ingestion worker for Deep Blue.
 
-OpenBB-first with yfinance fallback. Fetches daily candles, writes Parquet
-to disk per symbol, and prints exactly ONE JSON "ingestion report" to stdout.
+Extracted from market_ingest_worker.py for router integration.
+Contains all ingestion logic; the original file is now a thin wrapper.
 
 Provider strategy:
   1. Attempt OpenBB (provider="yfinance") for ALL symbols in a child process
@@ -10,10 +10,6 @@ Provider strategy:
   2. For any symbols that failed or timed out, fall back to direct yfinance.
   3. Per-result providerUsed reflects which provider actually succeeded:
      "openbb" or "yfinance".
-
-Usage:
-  python market_ingest_worker.py --symbols AMD,AAPL,TSLA --interval 1d \
-      --lookbackDays 365 --outRoot data_lake/market/ohlcv
 
 Output contract:
   - stdout: single JSON object matching IngestionReport schema (camelCase)
@@ -239,7 +235,7 @@ def _try_openbb_batch(symbols, interval, start_date, end_date):
 
     import queue
     try:
-        # FIX: The parent MUST read from the queue BEFORE joining, or else the OS 
+        # FIX: The parent MUST read from the queue BEFORE joining, or else the OS
         # pipe fills up with data and the child process deadlocks trying to exit!
         status, payload = q.get(timeout=timeout)
         error_msg = None
@@ -336,16 +332,17 @@ def _ingest_yfinance(symbol, interval, start_date, end_date, out_root, openbb_er
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    # Required on Windows where multiprocessing uses "spawn"
-    multiprocessing.freeze_support()
-
+def main(argv=None):
+    """
+    Entry point for market ingestion. Called by python_router.py or directly.
+    argv: list of CLI args (without script name). None = use sys.argv[1:].
+    """
     parser = argparse.ArgumentParser(description="Deep Blue OHLCV Ingestion Worker")
     parser.add_argument("--symbols", required=True, help="Comma-separated ticker symbols")
     parser.add_argument("--interval", default="1d", help="Candle interval (default: 1d)")
     parser.add_argument("--lookbackDays", type=int, default=365, help="Days of history (default: 365)")
     parser.add_argument("--outRoot", default="data_lake/market/ohlcv", help="Output root directory")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     if not symbols:

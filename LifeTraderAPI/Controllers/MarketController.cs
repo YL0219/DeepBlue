@@ -2,15 +2,14 @@
 // - Routes: GET /api/market/quote, GET /api/market/candles
 // - Serves real-time market data for the chart web app (Unity frontend).
 // - Symbols validated via SymbolValidator before any external call.
-// - Python calls use ProcessRunner with ArgumentList (injection-safe, no string concat).
-// - Python exe resolved via PythonPathResolver (uses venv, never bare "python" on PATH).
+// - All Python calls routed through PythonDispatcherService (single gateway).
 // - Responses cached 10s via IMemoryCache.
-// - Python processes gated by SemaphoreSlim (global cap of 3).
 
 using Microsoft.AspNetCore.Mvc;
 using System.Text.Json;
 using Microsoft.Extensions.Caching.Memory;
 using LifeTrader_AI.Infrastructure;
+using LifeTrader_AI.Infrastructure.Python;
 
 namespace LifeTraderAPI.Controllers
 {
@@ -29,19 +28,16 @@ namespace LifeTraderAPI.Controllers
         private const int PythonTimeoutMs = 30_000;
 
         private readonly IMemoryCache _cache;
-        private readonly SemaphoreSlim _pythonGate;
-        private readonly PythonPathResolver _pythonPath;
+        private readonly PythonDispatcherService _dispatcher;
         private readonly ILogger<MarketController> _logger;
 
         public MarketController(
             IMemoryCache cache,
-            SemaphoreSlim pythonGate,
-            PythonPathResolver pythonPath,
+            PythonDispatcherService dispatcher,
             ILogger<MarketController> logger)
         {
             _cache = cache;
-            _pythonGate = pythonGate;
-            _pythonPath = pythonPath;
+            _dispatcher = dispatcher;
             _logger = logger;
         }
 
@@ -64,7 +60,7 @@ namespace LifeTraderAPI.Controllers
             _logger.LogInformation("[Market] Quote request for {Symbol}", normalized);
 
             var (success, json, errorMsg) = await RunPythonFetcher(
-                new[] { "quote", "--symbol", normalized }, ct);
+                "fetch-quote", new[] { "--symbol", normalized }, ct);
             if (!success)
                 return StatusCode(502, new { error = errorMsg });
 
@@ -144,11 +140,11 @@ namespace LifeTraderAPI.Controllers
             // Build python args as a list (injection-safe via ArgumentList)
             var args = new List<string>
             {
-                "candles", "--symbol", normalized, "--tf", tf, "--range", range, "--limit", limit.ToString()
+                "--symbol", normalized, "--tf", tf, "--range", range, "--limit", limit.ToString()
             };
             if (to != null) { args.Add("--to"); args.Add(to); }
 
-            var (success, json, errorMsg) = await RunPythonFetcher(args, ct);
+            var (success, json, errorMsg) = await RunPythonFetcher("fetch-candles", args, ct);
             if (!success)
                 return StatusCode(502, new { error = errorMsg });
 
@@ -186,23 +182,17 @@ namespace LifeTraderAPI.Controllers
 
 
         /// <summary>
-        /// Runs fetchmarketdata.py via ProcessRunner. Gated by SemaphoreSlim.
-        /// Arguments passed as a list — injection-safe via ProcessStartInfo.ArgumentList.
+        /// Runs a market fetch action via PythonDispatcherService (single gateway).
         /// </summary>
         private async Task<(bool Success, string StdOut, string Error)> RunPythonFetcher(
-            IReadOnlyList<string> arguments, CancellationToken ct)
+            string action, IReadOnlyList<string> arguments, CancellationToken ct)
         {
-            if (!_pythonPath.IsAvailable)
+            if (!_dispatcher.IsAvailable)
                 return (false, "", "Python not available. Run setup_venv.ps1 to create the venv.");
 
-            await _pythonGate.WaitAsync(ct);
             try
             {
-                var allArgs = new List<string> { "fetchmarketdata.py" };
-                allArgs.AddRange(arguments);
-
-                var result = await ProcessRunner.RunAsync(
-                    _pythonPath.ExePath, allArgs, PythonTimeoutMs, ct);
+                var result = await _dispatcher.RunAsync("market", action, arguments, PythonTimeoutMs, ct);
 
                 if (result.TimedOut)
                     return (false, "", "Python process timed out.");
@@ -218,9 +208,9 @@ namespace LifeTraderAPI.Controllers
 
                 return (true, result.Stdout, "");
             }
-            finally
+            catch (OperationCanceledException)
             {
-                _pythonGate.Release();
+                return (false, "", "Request cancelled.");
             }
         }
     }

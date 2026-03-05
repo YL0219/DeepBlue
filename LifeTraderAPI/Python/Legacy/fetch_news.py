@@ -78,37 +78,45 @@ def get_news_data(symbol):
         result_news = f"Error: {str(e)}"
 
 # --- MAIN EXECUTION ---
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
+def main(argv=None):
+    """
+    Entry point for router integration. Called by python_router.py or directly.
+    argv: list of CLI args (without script name). None = use sys.argv[1:].
+    NOTE: This is a legacy script — stdout is human-readable text, NOT JSON.
+    """
+    global result_rsi, result_news, result_sentiment
+    # Reset globals (safe for repeated calls within same process)
+    result_rsi = -1.0
+    result_news = "No Data"
+    result_sentiment = 0.0
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv:
         print("Error: No symbol provided.")
         sys.exit(1)
 
-    symbol = sys.argv[1].upper()
+    symbol = argv[0].upper()
 
-    # 1. SETUP THE THREADS (The Waiters)
-    # We tell Thread 1 to run 'get_rsi_data' with 'symbol' as input
+    # 1. SETUP THE THREADS
     thread_rsi = threading.Thread(target=get_rsi_data, args=(symbol,))
-    
-    # We tell Thread 2 to run 'get_news_data'
     thread_news = threading.Thread(target=get_news_data, args=(symbol,))
 
-    # 2. START THE RACE (Launch them!)
+    # 2. START
     thread_rsi.start()
     thread_news.start()
 
-    # 3. WAIT FOR FINISH LINE (Join)
-    # This pauses the MAIN program until both threads are done
+    # 3. WAIT
     thread_rsi.join()
     thread_news.join()
 
     # 4. REPORT RESULTS
-    # Interpret RSI
     rsi_status = "NEUTRAL"
     if result_rsi == -1.0: rsi_status = "DATA ERROR"
     elif result_rsi >= 70: rsi_status = "OVERBOUGHT (SELL RISK)"
     elif result_rsi <= 30: rsi_status = "OVERSOLD (BUY CHANCE)"
 
-    # Interpret Sentiment
     sent_status = "NEUTRAL"
     if result_sentiment > 0.1: sent_status = "BULLISH"
     elif result_sentiment < -0.1: sent_status = "BEARISH"
@@ -119,3 +127,7 @@ if __name__ == "__main__":
     print("-" * 30)
     print("TOP NEWS HEADLINES:")
     print(result_news)
+
+
+if __name__ == "__main__":
+    main()

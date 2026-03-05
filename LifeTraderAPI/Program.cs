@@ -3,6 +3,8 @@ using LifeTrader_AI.Data;
 using LifeTrader_AI.Services;
 using LifeTrader_AI.Services.Ingestion;
 using LifeTrader_AI.Infrastructure;
+using LifeTrader_AI.Infrastructure.Python;
+using LifeTrader_AI.Infrastructure.Mcp;
 using Serilog;
 
 // --- 0. ENTERPRISE LOGGER (Serilog) ---
@@ -36,15 +38,39 @@ builder.Services.AddScoped<TradingService>();
 // 1.7 MEMORY CACHE (10s TTL, reduces redundant API calls)
 builder.Services.AddMemoryCache();
 
-// 1.8 PYTHON PROCESS THROTTLE (global cap of 3 concurrent Python processes)
-builder.Services.AddSingleton(new SemaphoreSlim(3, 3));
-
-// 1.9 PYTHON PATH RESOLVER (Singleton — resolves Python:ExePath once at startup)
+// 1.8 PYTHON PATH RESOLVER (Singleton — resolves Python:ExePath once at startup)
 // If the venv is missing, PythonPathResolver logs a warning but does NOT crash.
 builder.Services.AddSingleton<PythonPathResolver>();
 
+// 1.9 PYTHON DISPATCHER (Single gateway — the ONLY class that spawns Python processes)
+// Encapsulates SemaphoreSlim(3) gating internally. Routes all calls through python_router.py.
+builder.Services.AddSingleton<PythonDispatcherService>();
+
 // 1.10 MARKET DATA INGESTION (background 5-min OHLCV cycle)
 builder.Services.AddHostedService<MarketIngestionOrchestrator>();
+
+// 1.11 MCP SERVER (Model Context Protocol — HTTP/SSE transport)
+// Exposes market tools via MCP. Tools discovered from [McpServerToolType] classes in this assembly.
+// Endpoint: /mcp (mapped below via app.MapMcp())
+builder.Services
+    .AddMcpServer(options =>
+    {
+        options.ServerInfo = new()
+        {
+            Name = "DeepBlue",
+            Version = "1.0.0"
+        };
+    })
+    .WithHttpTransport()
+    .WithToolsFromAssembly();
+
+// 1.12 MCP ↔ OPENAI BRIDGE (translates MCP tool schemas for the OpenAI agent loop)
+// McpMarketTools: singleton — deps are all singletons, no mutable state.
+// McpToolSchemaAdapter: reflects on assembly to build OpenAI function schemas, caches result.
+// McpToolInvoker: routes OpenAI tool_call dispatch to MCP tool methods.
+builder.Services.AddSingleton<McpMarketTools>();
+builder.Services.AddSingleton<McpToolSchemaAdapter>();
+builder.Services.AddSingleton<McpToolInvoker>();
 
 // 2. CORS (Unity frontend)
 builder.Services.AddCors(options =>
@@ -59,22 +85,11 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
-// TODO: Migrate API keys from appsettings.json to user-secrets or environment variables.
-// appsettings.json should NOT contain secrets in shared/production environments.
-if (app.Environment.IsDevelopment())
-{
-    var config = app.Services.GetRequiredService<IConfiguration>();
-    if (!string.IsNullOrEmpty(config["OpenAI:ApiKey"]) && config["OpenAI:ApiKey"]!.StartsWith("sk-"))
-    {
-        Log.Warning("[Startup] API keys detected in appsettings.json. " +
-                    "Migrate to user-secrets or environment variables before deploying.");
-    }
-}
-
 // 3. MIDDLEWARE PIPELINE
 app.UseStaticFiles();
 app.UseCors("AllowUnity");
 app.MapControllers();
+app.MapMcp();   // MCP SSE/HTTP endpoint at /mcp
 
 app.Lifetime.ApplicationStopped.Register(Log.CloseAndFlush);
 

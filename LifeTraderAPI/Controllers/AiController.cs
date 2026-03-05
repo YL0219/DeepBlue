@@ -2,13 +2,14 @@
 // - Route: POST /api/ai/ask
 // - AI agent loop: sends user message to OpenAI, dispatches tool calls, returns response.
 // - Response shape: { response, uiActions, terminatedByCircuitBreaker, iterations }
-// - Read-only tools (fetch_market_data, open_chart) run in PARALLEL via Task.WhenAll.
+// - Read-only tools (fetch_market_data, open_chart, MCP tools) run in PARALLEL via Task.WhenAll.
 // - State-changing tools (execute_trade) run SERIALLY, max 1 per turn.
 // - Each tool task gets an ISOLATED DI scope (fresh DbContext). NEVER share DbContext across threads.
 // - history and uiActions are NEVER mutated inside parallel tasks — merged on main thread only.
 // - ToolRuns persisted in a single batch SaveChanges per turn for observability.
 // - Circuit breaker: max 10 iterations per request to prevent runaway token consumption.
 // - Symbols validated via SymbolValidator before any external call or Python arg.
+// - MCP tools dynamically discovered via McpToolSchemaAdapter and routed via McpToolInvoker.
 
 using Microsoft.AspNetCore.Mvc;
 using System.Text;
@@ -20,6 +21,8 @@ using LifeTrader_AI.Data;
 using LifeTrader_AI.Models;
 using LifeTrader_AI.Services;
 using LifeTrader_AI.Infrastructure;
+using LifeTrader_AI.Infrastructure.Python;
+using LifeTrader_AI.Infrastructure.Mcp;
 
 namespace LifeTraderAPI.Controllers
 {
@@ -47,11 +50,12 @@ namespace LifeTraderAPI.Controllers
 
         private readonly AppDbContext _db;
         private readonly IConfiguration _config;
-        private readonly SemaphoreSlim _pythonGate;
+        private readonly PythonDispatcherService _dispatcher;
         private readonly IMemoryCache _cache;
         private readonly IServiceScopeFactory _scopeFactory;
-        private readonly PythonPathResolver _pythonPath;
         private readonly ILogger<AiController> _logger;
+        private readonly McpToolSchemaAdapter _schemaAdapter;
+        private readonly McpToolInvoker _mcpInvoker;
 
         // --- Internal DTOs for parallel tool execution ---
 
@@ -72,19 +76,21 @@ namespace LifeTraderAPI.Controllers
         public AiController(
             AppDbContext db,
             IConfiguration config,
-            SemaphoreSlim pythonGate,
+            PythonDispatcherService dispatcher,
             IMemoryCache cache,
             IServiceScopeFactory scopeFactory,
-            PythonPathResolver pythonPath,
-            ILogger<AiController> logger)
+            ILogger<AiController> logger,
+            McpToolSchemaAdapter schemaAdapter,
+            McpToolInvoker mcpInvoker)
         {
             _db = db;
             _config = config;
-            _pythonGate = pythonGate;
+            _dispatcher = dispatcher;
             _cache = cache;
             _scopeFactory = scopeFactory;
-            _pythonPath = pythonPath;
             _logger = logger;
+            _schemaAdapter = schemaAdapter;
+            _mcpInvoker = mcpInvoker;
 
             // TODO: Migrate API keys to user-secrets or environment variables (separate task).
             // Keys in appsettings.json is a security risk in shared/production environments.
@@ -167,7 +173,8 @@ namespace LifeTraderAPI.Controllers
             // THREAD SAFETY: never mutated inside parallel tasks — only merged on main thread.
             var uiActions = new List<object>();
 
-            var toolsArray = new object[]
+            // --- Build tools array: hardcoded controller tools + dynamically discovered MCP tools ---
+            var hardcodedTools = new object[]
             {
                 new {
                     type = "function",
@@ -215,6 +222,12 @@ namespace LifeTraderAPI.Controllers
                     }
                 }
             };
+
+            // Merge hardcoded tools with dynamically discovered MCP tools
+            var mcpSchemas = _schemaAdapter.GetOpenAiToolSchemas();
+            var toolsArray = new List<object>(hardcodedTools);
+            foreach (var mcpTool in mcpSchemas)
+                toolsArray.Add(mcpTool);
 
             bool isAgentThinking = true;
             string finalAiResponse = "";
@@ -412,7 +425,7 @@ namespace LifeTraderAPI.Controllers
         // 4. ISOLATED TOOL EXECUTION — One DI scope per tool call
         //
         //    Each scope provides an independent DbContext + TradingService.
-        //    Singletons (IMemoryCache, SemaphoreSlim) resolve to the same instance — safe.
+        //    Singletons (IMemoryCache, PythonDispatcherService) resolve to the same instance — safe.
         //    Returns a ToolExecResult; the caller merges results on the main thread.
         // ================================================================
         private async Task<ToolExecResult> ExecuteToolInIsolatedScopeAsync(
@@ -530,7 +543,15 @@ namespace LifeTraderAPI.Controllers
                         }
 
                     default:
-                        toolResult = $"SYSTEM ERROR: Tool '{call.ToolName}' does not exist.";
+                        // Route to MCP tool invoker if the tool name is a registered MCP tool
+                        if (_schemaAdapter.GetMcpToolNames().Contains(call.ToolName))
+                        {
+                            toolResult = await _mcpInvoker.InvokeAsync(call.ToolName, call.ArgumentsJson, ct);
+                        }
+                        else
+                        {
+                            toolResult = $"SYSTEM ERROR: Tool '{call.ToolName}' does not exist.";
+                        }
                         break;
                 }
             }
@@ -564,7 +585,7 @@ namespace LifeTraderAPI.Controllers
 
 
         // ====================================================================
-        // DATA SCRAPERS — Use only singletons (cache, python gate, config).
+        // DATA SCRAPERS — Use only singletons (cache, dispatcher, config).
         //   Safe to call from parallel tasks because they never touch DbContext.
         // ====================================================================
         private async Task<(string price, string news)> FetchMarketData(
@@ -615,25 +636,21 @@ namespace LifeTraderAPI.Controllers
         }
 
         /// <summary>
-        /// Runs fetch_news.py gated by SemaphoreSlim to limit concurrent python processes.
-        /// Uses ProcessRunner with ArgumentList (injection-safe).
-        /// The python gate is a singleton — concurrent calls from parallel tool tasks
-        /// safely contend on the same semaphore (global cap of 3 python processes).
+        /// Runs fetch_news.py via PythonDispatcherService (single gateway).
+        /// Gated by the dispatcher's internal SemaphoreSlim (cap of 3 python processes).
+        /// NOTE: Legacy script — stdout is human-readable text, not JSON.
         /// </summary>
         private async Task<string> RunPythonHunter(string symbol, CancellationToken ct)
         {
-            if (!_pythonPath.IsAvailable)
+            if (!_dispatcher.IsAvailable)
                 return "SYSTEM ERROR: Python not available. Run setup_venv.ps1.";
 
             string normalized = SymbolValidator.Normalize(symbol);
 
-            await _pythonGate.WaitAsync(ct);
             try
             {
-                var result = await ProcessRunner.RunAsync(
-                    _pythonPath.ExePath,
-                    new[] { "fetch_news.py", normalized },
-                    PythonTimeoutMs, ct);
+                var result = await _dispatcher.RunAsync(
+                    "legacy", "fetch-news", new[] { normalized }, PythonTimeoutMs, ct);
 
                 if (result.TimedOut)
                     return "SYSTEM ERROR: Python process timed out (20s).";
@@ -646,10 +663,6 @@ namespace LifeTraderAPI.Controllers
                 return string.IsNullOrWhiteSpace(result.Stdout) ? "No data returned." : result.Stdout;
             }
             catch (Exception ex) { return $"SYSTEM ERROR: {ex.Message}"; }
-            finally
-            {
-                _pythonGate.Release();
-            }
         }
     }
 }

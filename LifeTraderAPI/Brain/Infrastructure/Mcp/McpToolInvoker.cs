@@ -15,6 +15,7 @@ namespace LifeTrader_AI.Infrastructure.Mcp
         private readonly McpMarketTools _marketTools;
         private readonly McpExecutionTools _executionTools;
         private readonly McpNewsTools _newsTools;
+        private readonly McpSkillTools _skillTools;
         private readonly ILogger<McpToolInvoker> _logger;
         private readonly IReadOnlyDictionary<string, ToolRoute> _routes;
         private readonly IReadOnlySet<string> _stateChangingTools;
@@ -23,11 +24,13 @@ namespace LifeTrader_AI.Infrastructure.Mcp
             McpMarketTools marketTools,
             McpExecutionTools executionTools,
             McpNewsTools newsTools,
+            McpSkillTools skillTools,
             ILogger<McpToolInvoker> logger)
         {
             _marketTools = marketTools;
             _executionTools = executionTools;
             _newsTools = newsTools;
+            _skillTools = skillTools;
             _logger = logger;
 
             var routes = new Dictionary<string, ToolRoute>(StringComparer.OrdinalIgnoreCase)
@@ -46,7 +49,13 @@ namespace LifeTrader_AI.Infrastructure.Mcp
                     Handler: InvokeGetNewsHeadlinesAsync),
                 ["scrape_website_text"] = new(
                     IsStateChanging: false,
-                    Handler: InvokeScrapeWebsiteTextAsync)
+                    Handler: InvokeScrapeWebsiteTextAsync),
+                ["get_available_skills"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeGetAvailableSkillsAsync),
+                ["read_skill_playbook"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeReadSkillPlaybookAsync)
             };
 
             _routes = routes;
@@ -175,6 +184,38 @@ namespace LifeTrader_AI.Infrastructure.Mcp
                 ? McpToolResult.Success(content)
                 : McpToolResult.Failure(content);
         }
+
+        // ─── Skill Tools ──────────────────────────────────────────────────
+
+        private Task<McpToolResult> InvokeGetAvailableSkillsAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            bool includeDeprecated = false;
+            if (root.TryGetProperty("include_deprecated", out var prop) &&
+                prop.ValueKind == JsonValueKind.True)
+            {
+                includeDeprecated = true;
+            }
+
+            string content = _skillTools.GetAvailableSkills(includeDeprecated);
+            return Task.FromResult(McpToolResult.Success(content));
+        }
+
+        private Task<McpToolResult> InvokeReadSkillPlaybookAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "skill_name", out string skillName, out string err))
+                return Task.FromResult(BuildInvokerFailure(err));
+
+            string content = _skillTools.ReadSkillPlaybook(skillName);
+            return Task.FromResult(InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content));
+        }
+
+        // ─── Argument Parsing Helpers ─────────────────────────────────────
 
         private static bool TryGetRequiredInt(
             JsonElement root,

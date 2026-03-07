@@ -5,6 +5,7 @@ using LifeTrader_AI.Services.Ingestion;
 using LifeTrader_AI.Infrastructure;
 using LifeTrader_AI.Infrastructure.Python;
 using LifeTrader_AI.Infrastructure.Mcp;
+using LifeTrader_AI.Infrastructure.Skills;
 using Serilog;
 
 // --- 0. ENTERPRISE LOGGER (Serilog) ---
@@ -65,13 +66,17 @@ builder.Services
     .WithHttpTransport()
     .WithToolsFromAssembly();
 
-// 1.12 MCP ↔ OPENAI BRIDGE (translates MCP tool schemas for the OpenAI agent loop)
+// 1.12 SKILL REGISTRY (Plan Engine — loads .md playbooks from Brain/Skills on startup)
+builder.Services.AddSingleton<ISkillRegistry, FileSkillRegistry>();
+
+// 1.13 MCP ↔ OPENAI BRIDGE (translates MCP tool schemas for the OpenAI agent loop)
 // McpMarketTools: singleton — deps are all singletons, no mutable state.
 // McpToolSchemaAdapter: reflects on assembly to build OpenAI function schemas, caches result.
 // McpToolInvoker: routes OpenAI tool_call dispatch to MCP tool methods.
 builder.Services.AddSingleton<McpMarketTools>();
 builder.Services.AddSingleton<McpExecutionTools>();
 builder.Services.AddSingleton<McpNewsTools>();
+builder.Services.AddSingleton<McpSkillTools>();
 builder.Services.AddSingleton<McpToolSchemaAdapter>();
 builder.Services.AddSingleton<McpToolInvoker>();
 
@@ -95,5 +100,16 @@ app.MapControllers();
 app.MapMcp();   // MCP SSE/HTTP endpoint at /mcp
 
 app.Lifetime.ApplicationStopped.Register(Log.CloseAndFlush);
+
+// Load skill registry — non-fatal on failure (ingestion pipeline must not crash)
+try
+{
+    var skillRegistry = app.Services.GetRequiredService<ISkillRegistry>();
+    skillRegistry.LoadAsync().GetAwaiter().GetResult();
+}
+catch (Exception ex)
+{
+    Log.Error(ex, "[Startup] Skill registry load failed — continuing with empty snapshot.");
+}
 
 app.Run();

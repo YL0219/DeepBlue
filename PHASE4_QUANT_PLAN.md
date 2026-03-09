@@ -1,86 +1,35 @@
-Project Deep Blue: Autonomous Market Agent
-AI Role Assignment
-You are the Lead Generator and Refactorer for Project Deep Blue. Your role is to write clean, highly optimized, and thread-safe code based strictly on the architectural directions provided by the user.
+# Project Aleph: Phase 4 Roadmap & Architecture
 
-CRITICAL RULES:
+## Core Architecture: The Triad
+We have evolved into a rigid, Domain-Driven Design (DDD) named **Project Aleph**. The system relies on three sovereign sectors:
 
-Security & Integrity First: Prioritize thread-safety and contract stability over new features.
+1. **Axiom (Sector_Core):** The Brain Stem. Handles databases, web scrapers, API controllers, and physical execution.
+2. **Arbiter (Sector_AI):** The Mind. Handles cognitive routing, LLM agents, and playbook execution.
+3. **Aether (Sector_Quant):** The Math. A dark-box environment for Bayesian math and Python probability matrices.
 
-Ask, Don't Guess: If anything is unclear, inspect the code or ask for clarification before changing behavior.
+**The Evolution Loop Concept:**
+Arbiter is designed to evolve Aether. Arbiter analyzes market narratives, and if the data shifts, Arbiter can trigger an update to Aether's probability weights. *Strict Boundary Rule: Arbiter cannot touch Aether directly. It must pass an `EvolutionRequest` to Axiom, and Axiom physically updates Aether.*
 
-Machine-Parseable Outputs: Any Python worker that returns structured output must print exactly one JSON object to stdout; logs go to stderr.
+## 🚀 CURRENT PHASE: Phase 4 (The Triad & The Aether Matrix)
 
-⚠️ ACTIVE TASK FOLDER CONTEXT (ANTI-HALLUCINATION)
-You are operating inside a restricted "Active Task" folder view. To save context window limits, the user is ONLY providing you with a sliced, partial view of the exact files you need to edit.
+### Pillar 1: The Master Scripts (Immediate Focus)
+We must lock in the C# boundaries before writing more logic.
+* [ ] Create `IAxiom` / `Axiom.cs` (The Central Hub).
+* [ ] Create `IArbiter` / `Arbiter.cs` (Injects IAxiom).
+* [ ] Create `IAether` / `Aether.cs` (Injects IAxiom).
+* [ ] Wire them into `Program.cs`.
 
-DO NOT assume missing files have been deleted.
+### Pillar 2: Asynchronous Data Lakes (Upcoming)
+Replace obsolete live-fetch Python scripts with robust Background Data Lakes.
+* Design SQLite-backed data vaults for News Extraction and SEC filings.
+* Update Arbiter's MCP tools to query these local databases instantly, ensuring the Agent never waits on fragile web-scrapers.
 
-DO NOT remove references to using statements or Python imports just because you cannot see the file in your current prompt.
+### Pillar 3: The Quant Engine & Evolution
+* Establish the Python environment within the `Aether` sector.
+* Build the Bayesian probability matrix scripts that consume the Data Lake.
+* Implement the Arbiter -> Axiom -> Aether Evolution Loop.
 
-Assume the global structure below is completely intact.
-
-Global System Hierarchy (Reference Only)
-This is the true structure of the project. Keep this in mind when resolving paths or namespaces.
-
-DeepBlue/
-├── AIWorkflow.sln
-├── CLAUDE.md
-├── PHASE4_QUANT_PLAN.md
-└── LifeTraderAPI/
-    ├── Program.cs
-    ├── appsettings.json
-    ├── deepblue.db
-    ├── fetchmarketdata.py
-    ├── market_ingest_worker.py
-    ├── requirements.txt
-    ├── setup_venv.ps1
-    ├── Controllers/
-    │   ├── AiController.cs
-    │   └── MarketController.cs
-    ├── Data/
-    │   ├── AppDbContext.cs
-    │   └── data_lake/
-    ├── Infrastructure/
-    │   ├── ProcessRunner.cs
-    │   ├── PythonPathResolver.cs
-    │   └── SymbolValidator.cs
-    ├── Migrations/
-    ├── Models/
-    │   ├── ChatMessage.cs, ChatRequest.cs, IngestionReport.cs
-    │   ├── MarketDataAsset.cs, Position.cs, ToolRun.cs
-    │   └── Trade.cs, WatchlistItem.cs
-    └── Services/
-        ├── TradingService.cs
-        └── Ingestion/
-            ├── ActiveSymbolSource.cs
-            ├── MarketIngestionOrchestrator.cs
-            └── PythonWorkerRunner.cs
-
-Core Architecture Invariants
-Backend Engine: C# ASP.NET Core Web API.
-
-EF Core DbContexts are scoped; NEVER share DbContext across parallel tasks.
-
-All external processes MUST use Infrastructure/ProcessRunner.cs.
-
-All Python paths MUST use Infrastructure/PythonPathResolver.cs.
-
-All symbols MUST be validated via Infrastructure/SymbolValidator.cs.
-
-Data Workers: Python scripts triggered via C# BackgroundServices.
-
-CURRENT PHASE: Phase 4 (The Quant Data Lakes & Tool Sync)
-Snapshot: Current Stage / Goals
-Stage Name: Phase 4 — Pillar 2 (Asynchronous Data Lakes & Tool Sync)
-Status: Market Data pipeline proven and codebase fully refactored. Obsolete live-fetch scripts (fetch_news.py) are being deprecated.
-Primary Goal: Build robust background ingestion orchestrators (News, SEC Filings) that save NLP-ready text to SQLite, and update the AI Controller tools to query these local databases instantly.
-
-Python Environment & Process Policy
-Backend MUST run Python using PythonPathResolver (points to .venv).
-
-Process calls MUST use ProcessRunner.RunAsync with ArgumentList. No string concatenated arguments.
-
-Observability / Logs
-All logging via ILogger<T> (Serilog). No Console.WriteLine in C# code.
-
-Standard prefixes: [AI], [Ingestion], [Market], [Trade], [Python].
+## Execution Policies
+* **Python Environment:** Backend MUST run Python using `PythonPathResolver`.
+* **Process Calls:** MUST use `ProcessRunner.RunAsync` with `ArgumentList`. No string concatenated arguments.
+* **Observability:** All logging via `ILogger<T>` (Serilog). Standard prefixes: `[Axiom]`, `[Arbiter]`, `[Aether]`, `[Python]`.

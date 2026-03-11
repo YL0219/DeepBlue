@@ -40,6 +40,7 @@ builder.Services.AddSingleton<PythonPathResolver>();
 builder.Services.AddSingleton<PythonDispatcherService>();
 
 builder.Services.AddHostedService<MarketIngestionOrchestrator>();
+builder.Services.AddHostedService<HeartbeatService>();
 
 builder.Services
     .AddMcpServer(options =>
@@ -59,6 +60,7 @@ builder.Services.AddSingleton<McpMarketTools>();
 builder.Services.AddSingleton<McpExecutionTools>();
 builder.Services.AddSingleton<McpNewsTools>();
 builder.Services.AddSingleton<McpSkillTools>();
+builder.Services.AddSingleton<McpAetherTools>();
 builder.Services.AddSingleton<McpToolSchemaAdapter>();
 builder.Services.AddSingleton<McpToolInvoker>();
 

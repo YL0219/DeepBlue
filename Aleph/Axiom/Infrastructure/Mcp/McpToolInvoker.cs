@@ -47,7 +47,25 @@ namespace Aleph
                     Handler: InvokeGetAvailableSkillsAsync),
                 ["read_skill_playbook"] = new(
                     IsStateChanging: false,
-                    Handler: InvokeReadSkillPlaybookAsync)
+                    Handler: InvokeReadSkillPlaybookAsync),
+                ["aether_get_status"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeAetherGetStatusAsync),
+                ["aether_math_run"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeAetherMathRunAsync),
+                ["aether_ml_predict"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeAetherMlPredictAsync),
+                ["aether_ml_train"] = new(
+                    IsStateChanging: true,
+                    Handler: InvokeAetherMlTrainAsync),
+                ["aether_sim_run"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeAetherSimRunAsync),
+                ["aether_macro_check"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeAetherMacroCheckAsync)
             };
 
             _routes = routes;
@@ -214,6 +232,115 @@ namespace Aleph
                 : McpToolResult.Failure(content));
         }
 
+        private async Task<McpToolResult> InvokeAetherGetStatusAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            string symbol = TryGetOptionalString(root, "symbol") ?? "";
+            var aetherTools = ResolveTool<McpAetherTools>();
+            string content = await aetherTools.AetherGetStatus(symbol, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
+
+        private async Task<McpToolResult> InvokeAetherMathRunAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "symbol", out string symbol, out string err))
+                return BuildInvokerFailure(err);
+
+            int days = 30;
+            if (root.TryGetProperty("days", out var daysProp))
+            {
+                if (!TryReadInt(daysProp, out days))
+                    return BuildInvokerFailure("Argument 'days' must be an integer.");
+            }
+
+            var aetherTools = ResolveTool<McpAetherTools>();
+            string content = await aetherTools.AetherMathRun(symbol, days, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
+
+        private async Task<McpToolResult> InvokeAetherMlPredictAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "symbol", out string symbol, out string err))
+                return BuildInvokerFailure(err);
+
+            int horizonDays = 5;
+            if (root.TryGetProperty("horizon_days", out var hdProp))
+            {
+                if (!TryReadInt(hdProp, out horizonDays))
+                    return BuildInvokerFailure("Argument 'horizon_days' must be an integer.");
+            }
+
+            var aetherTools = ResolveTool<McpAetherTools>();
+            string content = await aetherTools.AetherMlPredict(symbol, horizonDays, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
+
+        private async Task<McpToolResult> InvokeAetherMlTrainAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "symbol", out string symbol, out string err))
+                return BuildInvokerFailure(err);
+
+            int epochs = 1;
+            if (root.TryGetProperty("epochs", out var epochsProp))
+            {
+                if (!TryReadInt(epochsProp, out epochs))
+                    return BuildInvokerFailure("Argument 'epochs' must be an integer.");
+            }
+
+            var aetherTools = ResolveTool<McpAetherTools>();
+            string content = await aetherTools.AetherMlTrain(symbol, epochs, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
+
+        private async Task<McpToolResult> InvokeAetherSimRunAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "symbol", out string symbol, out string err))
+                return BuildInvokerFailure(err);
+
+            int days = 180;
+            if (root.TryGetProperty("days", out var daysProp))
+            {
+                if (!TryReadInt(daysProp, out days))
+                    return BuildInvokerFailure("Argument 'days' must be an integer.");
+            }
+
+            string strategy = TryGetOptionalString(root, "strategy") ?? "baseline";
+
+            var aetherTools = ResolveTool<McpAetherTools>();
+            string content = await aetherTools.AetherSimRun(symbol, days, strategy, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
+
+        private async Task<McpToolResult> InvokeAetherMacroCheckAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            string region = TryGetOptionalString(root, "region") ?? "global";
+            var aetherTools = ResolveTool<McpAetherTools>();
+            string content = await aetherTools.AetherMacroCheck(region, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
         // ─── Argument Parsing Helpers ─────────────────────────────────────
 
         private static bool TryGetRequiredInt(
@@ -384,3 +511,4 @@ namespace Aleph
         }
     }
 }
+

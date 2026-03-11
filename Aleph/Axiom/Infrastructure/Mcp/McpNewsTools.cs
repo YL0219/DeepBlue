@@ -9,7 +9,7 @@ namespace Aleph
 {
     /// <summary>
     /// MCP tools for atomic news retrieval and website scraping.
-    /// All Python execution is routed through PythonDispatcherService + python_router.py.
+    /// All Python execution is routed through IAxiom.Python + python_router.py.
     /// </summary>
     [McpServerToolType]
     public sealed class McpNewsTools
@@ -24,14 +24,14 @@ namespace Aleph
         private const int ScrapeMaxTimeoutSec = 30;
         private const int ScrapeTimeoutBufferMs = 1_500;
 
-        private readonly PythonDispatcherService _dispatcher;
+        private readonly IAxiom _axiom;
         private readonly ILogger<McpNewsTools> _logger;
 
         public McpNewsTools(
-            PythonDispatcherService dispatcher,
+            IAxiom axiom,
             ILogger<McpNewsTools> logger)
         {
-            _dispatcher = dispatcher;
+            _axiom = axiom;
             _logger = logger;
         }
 
@@ -62,11 +62,6 @@ namespace Aleph
                 _logger.LogDebug("[MCP/News] limit clamped from {Requested} to {Clamped}", limit, clampedLimit);
             }
 
-            if (!_dispatcher.IsAvailable)
-            {
-                return BuildErrorJson("Python environment not available. Run setup_venv.ps1 to create the venv.");
-            }
-
             var args = new List<string>();
             if (!string.IsNullOrWhiteSpace(normalizedSymbol))
             {
@@ -79,7 +74,7 @@ namespace Aleph
 
             try
             {
-                var result = await _dispatcher.RunAsync("news", "headlines", args, HeadlinesTimeoutMs, ct);
+                var result = await _axiom.Python.RunJsonAsync("news", "headlines", args, HeadlinesTimeoutMs, ct);
 
                 if (result.TimedOut)
                 {
@@ -88,6 +83,12 @@ namespace Aleph
 
                 if (!result.Success)
                 {
+                    if (result.ExitCode == -1 &&
+                        result.Stderr.Contains("Python not available", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return BuildErrorJson("Python environment not available. Run setup_venv.ps1 to create the venv.");
+                    }
+
                     _logger.LogWarning(
                         "[MCP/News] headlines failed: exit={ExitCode}, stderr={Stderr}",
                         result.ExitCode, result.Stderr);
@@ -95,12 +96,12 @@ namespace Aleph
                     return BuildErrorJson($"News headlines worker failed (exit code {result.ExitCode}).");
                 }
 
-                if (string.IsNullOrWhiteSpace(result.Stdout))
+                if (string.IsNullOrWhiteSpace(result.StdoutJson))
                 {
                     return BuildErrorJson("News headlines worker returned empty stdout.");
                 }
 
-                return result.Stdout;
+                return result.StdoutJson;
             }
             catch (Exception ex)
             {
@@ -141,11 +142,6 @@ namespace Aleph
                 return BuildErrorJson(validation.ErrorMessage);
             }
 
-            if (!_dispatcher.IsAvailable)
-            {
-                return BuildErrorJson("Python environment not available. Run setup_venv.ps1 to create the venv.");
-            }
-
             int clampedTimeoutSec = Math.Clamp(timeoutSec, ScrapeMinTimeoutSec, ScrapeMaxTimeoutSec);
             int timeoutMs = (clampedTimeoutSec * 1000) + ScrapeTimeoutBufferMs;
 
@@ -157,7 +153,7 @@ namespace Aleph
 
             try
             {
-                var result = await _dispatcher.RunAsync("news", "scrape", args, timeoutMs, ct);
+                var result = await _axiom.Python.RunJsonAsync("news", "scrape", args, timeoutMs, ct);
 
                 if (result.TimedOut)
                 {
@@ -166,6 +162,12 @@ namespace Aleph
 
                 if (!result.Success)
                 {
+                    if (result.ExitCode == -1 &&
+                        result.Stderr.Contains("Python not available", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return BuildErrorJson("Python environment not available. Run setup_venv.ps1 to create the venv.");
+                    }
+
                     _logger.LogWarning(
                         "[MCP/News] scrape failed: exit={ExitCode}, stderr={Stderr}",
                         result.ExitCode, result.Stderr);
@@ -173,12 +175,12 @@ namespace Aleph
                     return BuildErrorJson($"Website scrape worker failed (exit code {result.ExitCode}).");
                 }
 
-                if (string.IsNullOrWhiteSpace(result.Stdout))
+                if (string.IsNullOrWhiteSpace(result.StdoutJson))
                 {
                     return BuildErrorJson("Website scrape worker returned empty stdout.");
                 }
 
-                return result.Stdout;
+                return result.StdoutJson;
             }
             catch (Exception ex)
             {

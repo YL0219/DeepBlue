@@ -23,14 +23,14 @@ namespace Aleph
             "7d", "30d", "90d", "180d", "1y", "2y"
         };
 
-        private readonly IServiceScopeFactory _scopeFactory;
+        private readonly IAxiom _axiom;
         private readonly ILogger<McpExecutionTools> _logger;
 
         public McpExecutionTools(
-            IServiceScopeFactory scopeFactory,
+            IAxiom axiom,
             ILogger<McpExecutionTools> logger)
         {
-            _scopeFactory = scopeFactory;
+            _axiom = axiom;
             _logger = logger;
         }
 
@@ -97,10 +97,7 @@ namespace Aleph
                 _logger.LogWarning("[MCP] execute_trade price clamped from {Requested} to {Clamped}",
                     price, clampedPrice);
 
-            using var scope = _scopeFactory.CreateScope();
-            var tradingService = scope.ServiceProvider.GetRequiredService<TradingService>();
-
-            var tradeReq = new TradeRequest
+            var tradeReq = new ExecuteTradeRequest
             {
                 ClientRequestId = Guid.NewGuid().ToString(),
                 Symbol = normalizedSymbol,
@@ -110,7 +107,7 @@ namespace Aleph
                 Currency = "USD"
             };
 
-            var result = await tradingService.ExecuteTradeAsync(tradeReq);
+            var result = await _axiom.Trades.ExecuteTradeAsync(tradeReq, ct);
             if (!result.Success)
                 return McpToolResult.Failure($"ERROR: {result.ErrorMessage}");
 

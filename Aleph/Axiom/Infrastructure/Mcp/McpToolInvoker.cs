@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Aleph
 {
@@ -12,25 +13,16 @@ namespace Aleph
             bool IsStateChanging,
             Func<JsonElement, CancellationToken, Task<McpToolResult>> Handler);
 
-        private readonly McpMarketTools _marketTools;
-        private readonly McpExecutionTools _executionTools;
-        private readonly McpNewsTools _newsTools;
-        private readonly McpSkillTools _skillTools;
+        private readonly IServiceProvider _serviceProvider;
         private readonly ILogger<McpToolInvoker> _logger;
         private readonly IReadOnlyDictionary<string, ToolRoute> _routes;
         private readonly IReadOnlySet<string> _stateChangingTools;
 
         public McpToolInvoker(
-            McpMarketTools marketTools,
-            McpExecutionTools executionTools,
-            McpNewsTools newsTools,
-            McpSkillTools skillTools,
+            IServiceProvider serviceProvider,
             ILogger<McpToolInvoker> logger)
         {
-            _marketTools = marketTools;
-            _executionTools = executionTools;
-            _newsTools = newsTools;
-            _skillTools = skillTools;
+            _serviceProvider = serviceProvider;
             _logger = logger;
 
             var routes = new Dictionary<string, ToolRoute>(StringComparer.OrdinalIgnoreCase)
@@ -113,7 +105,8 @@ namespace Aleph
                     return BuildInvokerFailure("Argument 'days' must be an integer.");
             }
 
-            string content = await _marketTools.QueryLocalMarketData(symbol, days);
+            var marketTools = ResolveTool<McpMarketTools>();
+            string content = await marketTools.QueryLocalMarketData(symbol, days);
             return InferSuccess(content)
                 ? McpToolResult.Success(content)
                 : McpToolResult.Failure(content);
@@ -133,7 +126,8 @@ namespace Aleph
             if (!TryGetRequiredDecimal(root, "price", out decimal price, out string priceErr))
                 return Task.FromResult(BuildInvokerFailure(priceErr));
 
-            return _executionTools.ExecuteTradeInternalAsync(action, symbol, shares, price, ct);
+            var executionTools = ResolveTool<McpExecutionTools>();
+            return executionTools.ExecuteTradeInternalAsync(action, symbol, shares, price, ct);
         }
 
         private Task<McpToolResult> InvokeOpenChartAsync(JsonElement root, CancellationToken ct)
@@ -143,7 +137,8 @@ namespace Aleph
 
             string? tf = TryGetOptionalString(root, "tf");
             string? range = TryGetOptionalString(root, "range");
-            return Task.FromResult(_executionTools.OpenChartInternal(symbol, tf, range));
+            var executionTools = ResolveTool<McpExecutionTools>();
+            return Task.FromResult(executionTools.OpenChartInternal(symbol, tf, range));
         }
 
         private async Task<McpToolResult> InvokeGetNewsHeadlinesAsync(
@@ -159,7 +154,8 @@ namespace Aleph
                     return BuildInvokerFailure("Argument 'limit' must be an integer.");
             }
 
-            string content = await _newsTools.GetNewsHeadlines(symbol, limit, ct);
+            var newsTools = ResolveTool<McpNewsTools>();
+            string content = await newsTools.GetNewsHeadlines(symbol, limit, ct);
             return InferSuccess(content)
                 ? McpToolResult.Success(content)
                 : McpToolResult.Failure(content);
@@ -179,7 +175,8 @@ namespace Aleph
                     return BuildInvokerFailure("Argument 'timeoutSec' must be an integer.");
             }
 
-            string content = await _newsTools.ScrapeWebsiteText(url, timeoutSec, ct);
+            var newsTools = ResolveTool<McpNewsTools>();
+            string content = await newsTools.ScrapeWebsiteText(url, timeoutSec, ct);
             return InferSuccess(content)
                 ? McpToolResult.Success(content)
                 : McpToolResult.Failure(content);
@@ -198,7 +195,8 @@ namespace Aleph
                 includeDeprecated = true;
             }
 
-            string content = _skillTools.GetAvailableSkills(includeDeprecated);
+            var skillTools = ResolveTool<McpSkillTools>();
+            string content = skillTools.GetAvailableSkills(includeDeprecated);
             return Task.FromResult(McpToolResult.Success(content));
         }
 
@@ -209,7 +207,8 @@ namespace Aleph
             if (!TryGetRequiredString(root, "skill_name", out string skillName, out string err))
                 return Task.FromResult(BuildInvokerFailure(err));
 
-            string content = _skillTools.ReadSkillPlaybook(skillName);
+            var skillTools = ResolveTool<McpSkillTools>();
+            string content = skillTools.ReadSkillPlaybook(skillName);
             return Task.FromResult(InferSuccess(content)
                 ? McpToolResult.Success(content)
                 : McpToolResult.Failure(content));
@@ -377,6 +376,11 @@ namespace Aleph
         {
             string escaped = message.Replace("\\", "\\\\").Replace("\"", "\\\"");
             return $"{{\"ok\":false,\"error\":\"{escaped}\"}}";
+        }
+
+        private TTool ResolveTool<TTool>() where TTool : notnull
+        {
+            return _serviceProvider.GetRequiredService<TTool>();
         }
     }
 }

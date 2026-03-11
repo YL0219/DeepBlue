@@ -1,18 +1,10 @@
 // CONTRACT / INVARIANTS
 // - BackgroundService: runs a 5-minute ingestion loop for active symbols.
 // - Active symbols = portfolio holdings (IsOpen or Quantity > 0) UNION watchlist (IsActive).
-// - Each cycle creates a fresh DI scope (scoped DbContext). NEVER reuse DbContext across cycles.
-// - Batches of 10 symbols per PythonWorkerRunner invocation.
-// - Upserts MarketDataAsset metadata rows from the worker's IngestionReport.
+// - Batches of 10 symbols per ingestion invocation.
+// - DB writes and Python execution are routed through IAxiom.MarketIngestion.
 // - If Python is unavailable at startup, logs a warning and disables ingestion (does NOT crash).
 // - Parquet path contract: data_lake/market/ohlcv/symbol=<SYM>/interval=<INTERVAL>/latest.parquet
-
-using System.Globalization;
-using Microsoft.EntityFrameworkCore;
-
-
-
-
 
 namespace Aleph
 {
@@ -28,31 +20,21 @@ namespace Aleph
         private const string DefaultInterval = "1d";
         private const string OutRoot = "data_lake/market/ohlcv";
 
-        private readonly IServiceScopeFactory _scopeFactory;
-        private readonly PythonDispatcherService _dispatcher;
-        private readonly PythonWorkerRunner _runner;
+        private readonly IAxiom _axiom;
         private readonly ILogger<MarketIngestionOrchestrator> _logger;
 
         public MarketIngestionOrchestrator(
-            IServiceScopeFactory scopeFactory,
-            PythonDispatcherService dispatcher,
-            ILogger<MarketIngestionOrchestrator> logger,
-            ILoggerFactory loggerFactory)
+            IAxiom axiom,
+            ILogger<MarketIngestionOrchestrator> logger)
         {
-            _scopeFactory = scopeFactory;
-            _dispatcher = dispatcher;
+            _axiom = axiom;
             _logger = logger;
-
-            // PythonWorkerRunner is stateless — safe to create once and reuse.
-            _runner = new PythonWorkerRunner(
-                dispatcher,
-                loggerFactory.CreateLogger<PythonWorkerRunner>());
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             // If Python is not available, disable ingestion gracefully (don't crash the app).
-            if (!_dispatcher.IsAvailable)
+            if (!_axiom.MarketIngestion.IsPythonAvailable)
             {
                 _logger.LogWarning(
                     "[Ingestion] Python not available. " +
@@ -63,11 +45,11 @@ namespace Aleph
 
             _logger.LogInformation("[Ingestion] Market data ingestion service started.");
 
-            // Short delay so the app, DB migration, and WAL pragma all finish first
+            // Short delay so the app, DB migration, and WAL pragma all finish first.
             try { await Task.Delay(StartupDelay, stoppingToken); }
             catch (OperationCanceledException) { return; }
 
-            // Run once immediately, then on a 5-minute timer
+            // Run once immediately, then on a 5-minute timer.
             await RunIngestionCycleAsync(stoppingToken);
 
             using var timer = new PeriodicTimer(Interval);
@@ -83,11 +65,7 @@ namespace Aleph
 
             try
             {
-                using var scope = _scopeFactory.CreateScope();
-                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-                var symbolSource = new ActiveSymbolSource(db);
-
-                var symbols = await symbolSource.GetActiveSymbolsAsync(ct);
+                var symbols = await _axiom.MarketIngestion.GetActiveSymbolsAsync(ct);
                 if (symbols.Count == 0)
                 {
                     _logger.LogInformation("[Ingestion] No active symbols to ingest. Skipping.");
@@ -97,88 +75,29 @@ namespace Aleph
                 _logger.LogInformation("[Ingestion] Active symbols ({Count}): {Symbols}",
                     symbols.Count, string.Join(", ", symbols));
 
-                // Chunk into batches of BatchSize
                 var batches = symbols.Chunk(BatchSize).ToList();
-
                 for (int i = 0; i < batches.Count; i++)
                 {
                     ct.ThrowIfCancellationRequested();
-                    var batch = batches[i];
+
+                    var batchSymbols = batches[i].ToList();
                     _logger.LogInformation("[Ingestion] Processing batch {Current}/{Total}: {Symbols}",
-                        i + 1, batches.Count, string.Join(", ", batch));
+                        i + 1, batches.Count, string.Join(", ", batchSymbols));
 
-                    var report = await _runner.RunMarketIngestAsync(
-                        batch.ToList(), DefaultInterval, LookbackDays, OutRoot, ct);
+                    var runResult = await _axiom.MarketIngestion.RunIngestionBatchAsync(
+                        batchSymbols, DefaultInterval, LookbackDays, OutRoot, ct);
 
-                    if (report == null)
+                    if (runResult.Report is not null)
                     {
-                        // Worker failed entirely — increment failures for all symbols in batch
-                        _logger.LogWarning("[Ingestion] Worker returned null report. Marking batch as failed.");
-                        foreach (var sym in batch)
-                        {
-                            await UpsertAssetFailureAsync(db, sym, DefaultInterval,
-                                "Worker process failed or timed out.", ct);
-                        }
-                        await db.SaveChangesAsync(ct);
-                        continue;
+                        _logger.LogInformation(
+                            "[Ingestion] Report received: jobId={JobId}, duration={Duration}ms, results={Count}",
+                            runResult.Report.JobId,
+                            runResult.Report.DurationMs,
+                            runResult.Report.Results.Count);
                     }
 
-                    _logger.LogInformation("[Ingestion] Report received: jobId={JobId}, duration={Duration}ms, results={Count}",
-                        report.JobId, report.DurationMs, report.Results.Count);
-
-                    // Upsert MarketDataAsset for each result
-                    foreach (var result in report.Results)
-                    {
-                        var asset = await db.MarketDataAssets
-                            .FirstOrDefaultAsync(a => a.Symbol == result.Symbol && a.Interval == result.Interval, ct);
-
-                        if (asset == null)
-                        {
-                            asset = new MarketDataAsset
-                            {
-                                Symbol = result.Symbol,
-                                Interval = result.Interval
-                            };
-                            db.MarketDataAssets.Add(asset);
-                        }
-
-                        if (result.IsSuccess)
-                        {
-                            asset.ParquetPath = result.ParquetPath;
-                            asset.LastIngestedAtUtc = DateTime.UtcNow;
-                            asset.ProviderUsed = result.ProviderUsed;
-                            asset.RowsWritten = result.RowsWritten;
-                            asset.ConsecutiveFailures = 0;
-                            asset.LastError = null;
-
-                            if (DateTime.TryParse(result.DataEndUtc, CultureInfo.InvariantCulture,
-                                    DateTimeStyles.RoundtripKind, out var dataEnd))
-                            {
-                                asset.LastDataEndUtc = dataEnd;
-                            }
-
-                            _logger.LogInformation("[Ingestion]   {Symbol}: OK via {Provider} ({Rows} rows -> {Path})",
-                                result.Symbol, result.ProviderUsed, result.RowsWritten, result.ParquetPath);
-                        }
-                        else
-                        {
-                            asset.ConsecutiveFailures++;
-                            asset.LastError = result.Error?.Message ?? "Unknown error";
-                            _logger.LogWarning("[Ingestion]   {Symbol}: FAIL ({Failures}x) - {Error}",
-                                result.Symbol, asset.ConsecutiveFailures, asset.LastError);
-                        }
-
-                        asset.UpdatedAtUtc = DateTime.UtcNow;
-                    }
-
-                    await db.SaveChangesAsync(ct);
-
-                    // Log warnings from the worker
-                    if (report.Warnings.Count > 0)
-                    {
-                        foreach (var w in report.Warnings)
-                            _logger.LogWarning("[Ingestion] Worker warning: {Warning}", w);
-                    }
+                    await _axiom.MarketIngestion.ApplyIngestionBatchAsync(
+                        batchSymbols, DefaultInterval, runResult, ct);
                 }
 
                 _logger.LogInformation("[Ingestion] Cycle complete.");
@@ -191,23 +110,6 @@ namespace Aleph
             {
                 _logger.LogError(ex, "[Ingestion] Cycle failed.");
             }
-        }
-
-        private static async Task UpsertAssetFailureAsync(
-            AppDbContext db, string symbol, string interval, string error, CancellationToken ct)
-        {
-            var asset = await db.MarketDataAssets
-                .FirstOrDefaultAsync(a => a.Symbol == symbol && a.Interval == interval, ct);
-
-            if (asset == null)
-            {
-                asset = new MarketDataAsset { Symbol = symbol, Interval = interval };
-                db.MarketDataAssets.Add(asset);
-            }
-
-            asset.ConsecutiveFailures++;
-            asset.LastError = error;
-            asset.UpdatedAtUtc = DateTime.UtcNow;
         }
     }
 }

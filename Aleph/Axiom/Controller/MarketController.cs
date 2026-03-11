@@ -2,14 +2,10 @@
 // - Routes: GET /api/market/quote, GET /api/market/candles
 // - Serves real-time market data for the chart web app (Unity frontend).
 // - Symbols validated via SymbolValidator before any external call.
-// - All Python calls routed through PythonDispatcherService (single gateway).
-// - Responses cached 10s via IMemoryCache.
+// - Market data fetches route through IAxiom market gateway.
+// - Responses cached 10s via IAxiom market gateway.
 
 using Microsoft.AspNetCore.Mvc;
-using System.Text.Json;
-using Microsoft.Extensions.Caching.Memory;
-
-
 
 namespace Aleph
 {
@@ -25,19 +21,15 @@ namespace Aleph
 
         private const int DefaultLimit = 500;
         private const int MaxLimit = 2000;
-        private const int PythonTimeoutMs = 30_000;
 
-        private readonly IMemoryCache _cache;
-        private readonly PythonDispatcherService _dispatcher;
+        private readonly IAxiom _axiom;
         private readonly ILogger<MarketController> _logger;
 
         public MarketController(
-            IMemoryCache cache,
-            PythonDispatcherService dispatcher,
+            IAxiom axiom,
             ILogger<MarketController> logger)
         {
-            _cache = cache;
-            _dispatcher = dispatcher;
+            _axiom = axiom;
             _logger = logger;
         }
 
@@ -49,48 +41,25 @@ namespace Aleph
             if (!SymbolValidator.TryNormalize(symbol, out var normalized))
                 return BadRequest(new { error = "Invalid symbol. Must be 1-15 alphanumeric characters (A-Z, 0-9, dot, hyphen)." });
 
-            // Check cache first
-            string cacheKey = $"quote:{normalized}";
-            if (_cache.TryGetValue(cacheKey, out object? cachedQuote))
-            {
-                _logger.LogDebug("[Market] Cache hit: {CacheKey}", cacheKey);
-                return Ok(cachedQuote);
-            }
-
             _logger.LogInformation("[Market] Quote request for {Symbol}", normalized);
 
-            var (success, json, errorMsg) = await RunPythonFetcher(
-                "fetch-quote", new[] { "--symbol", normalized }, ct);
-            if (!success)
-                return StatusCode(502, new { error = errorMsg });
-
-            try
+            var result = await _axiom.Market.GetQuoteAsync(normalized, ct);
+            if (!result.Success)
             {
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-
-                if (!root.TryGetProperty("ok", out var okProp) || !okProp.GetBoolean())
-                {
-                    string pyError = root.TryGetProperty("error", out var errProp) ? errProp.GetString() ?? "Unknown" : "Unknown";
-                    return StatusCode(502, new { error = pyError });
-                }
-
-                var result = new
-                {
-                    symbol = root.GetProperty("symbol").GetString(),
-                    price = root.GetProperty("price").GetDouble(),
-                    timestampUtc = root.GetProperty("timestampUtc").GetString()
-                };
-
-                // Cache successful quote for 10 seconds
-                _cache.Set(cacheKey, result, TimeSpan.FromSeconds(10));
-                return Ok(result);
+                return StatusCode(502, new { error = result.ErrorMessage ?? "Unknown" });
             }
-            catch (JsonException ex)
+
+            if (result.Quote is null)
             {
-                _logger.LogWarning(ex, "[Market] JSON parse error for quote {Symbol}", normalized);
                 return StatusCode(502, new { error = "Invalid response from data fetcher." });
             }
+
+            return Ok(new
+            {
+                symbol = result.Quote.Symbol,
+                price = result.Quote.Price,
+                timestampUtc = result.Quote.TimestampUtc
+            });
         }
 
 
@@ -126,92 +95,29 @@ namespace Aleph
             if (to != null && !double.TryParse(to, out _))
                 return BadRequest(new { error = "Invalid 'to' parameter. Must be a unix timestamp." });
 
-            // Check cache first
-            string cacheKey = $"candles:{normalized}:{tf}:{range}:{limit}:{to ?? "latest"}";
-            if (_cache.TryGetValue(cacheKey, out object? cachedCandles))
-            {
-                _logger.LogDebug("[Market] Cache hit: {CacheKey}", cacheKey);
-                return Ok(cachedCandles);
-            }
-
             _logger.LogInformation("[Market] Candles request: {Symbol} tf={Tf} range={Range} limit={Limit} to={To}",
                 normalized, tf, range, limit, to ?? "latest");
 
-            // Build python args as a list (injection-safe via ArgumentList)
-            var args = new List<string>
+            var result = await _axiom.Market.GetCandlesAsync(
+                new MarketCandlesQuery(normalized, tf, range, limit, to),
+                ct);
+            if (!result.Success)
             {
-                "--symbol", normalized, "--tf", tf, "--range", range, "--limit", limit.ToString()
-            };
-            if (to != null) { args.Add("--to"); args.Add(to); }
-
-            var (success, json, errorMsg) = await RunPythonFetcher("fetch-candles", args, ct);
-            if (!success)
-                return StatusCode(502, new { error = errorMsg });
-
-            try
-            {
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-
-                if (!root.TryGetProperty("ok", out var okProp) || !okProp.GetBoolean())
-                {
-                    string pyError = root.TryGetProperty("error", out var errProp) ? errProp.GetString() ?? "Unknown" : "Unknown";
-                    return StatusCode(502, new { error = pyError });
-                }
-
-                // Pass through the structured response
-                var result = new
-                {
-                    symbol = root.GetProperty("symbol").GetString(),
-                    tf = root.GetProperty("tf").GetString(),
-                    candles = root.GetProperty("candles").Clone(),
-                    nextTo = root.TryGetProperty("nextTo", out var ntProp) && ntProp.ValueKind != JsonValueKind.Null
-                        ? ntProp.GetInt64() : (long?)null
-                };
-
-                // Cache successful candles for 10 seconds
-                _cache.Set(cacheKey, result, TimeSpan.FromSeconds(10));
-                return Ok(result);
+                return StatusCode(502, new { error = result.ErrorMessage ?? "Unknown" });
             }
-            catch (JsonException ex)
+
+            if (result.Candles is null)
             {
-                _logger.LogWarning(ex, "[Market] JSON parse error for candles {Symbol}", normalized);
                 return StatusCode(502, new { error = "Invalid response from data fetcher." });
             }
-        }
 
-
-        /// <summary>
-        /// Runs a market fetch action via PythonDispatcherService (single gateway).
-        /// </summary>
-        private async Task<(bool Success, string StdOut, string Error)> RunPythonFetcher(
-            string action, IReadOnlyList<string> arguments, CancellationToken ct)
-        {
-            if (!_dispatcher.IsAvailable)
-                return (false, "", "Python not available. Run setup_venv.ps1 to create the venv.");
-
-            try
+            return Ok(new
             {
-                var result = await _dispatcher.RunAsync("market", action, arguments, PythonTimeoutMs, ct);
-
-                if (result.TimedOut)
-                    return (false, "", "Python process timed out.");
-
-                if (!result.Success)
-                {
-                    _logger.LogWarning("[Market] Python stderr: {Stderr}", result.Stderr);
-                    return (false, "", $"Python exited with code {result.ExitCode}: {result.Stderr}");
-                }
-
-                if (string.IsNullOrWhiteSpace(result.Stdout))
-                    return (false, "", "Python returned empty output.");
-
-                return (true, result.Stdout, "");
-            }
-            catch (OperationCanceledException)
-            {
-                return (false, "", "Request cancelled.");
-            }
+                symbol = result.Candles.Symbol,
+                tf = result.Candles.Tf,
+                candles = result.Candles.Candles,
+                nextTo = result.Candles.NextTo
+            });
         }
     }
 }

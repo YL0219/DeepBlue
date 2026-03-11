@@ -1,10 +1,13 @@
 using System.Text.Json.Nodes;
+using System.Text.Json;
 
 namespace Aleph;
 
 public interface IAxiom
 {
     IAxiom.IPythonRouter Python { get; }
+    IAxiom.IMarketGateway Market { get; }
+    IAxiom.IMarketIngestionGateway MarketIngestion { get; }
     IAxiom.IMcpGateway Mcp { get; }
     IAxiom.ITradeGateway Trades { get; }
     IAxiom.IChatGateway Chat { get; }
@@ -18,6 +21,38 @@ public interface IAxiom
             string action,
             IReadOnlyList<string> arguments,
             int timeoutMs,
+            CancellationToken ct = default);
+    }
+
+    public interface IMarketGateway
+    {
+        Task<MarketQuoteFetchResult> GetQuoteAsync(
+            string normalizedSymbol,
+            CancellationToken ct = default);
+
+        Task<MarketCandlesFetchResult> GetCandlesAsync(
+            MarketCandlesQuery query,
+            CancellationToken ct = default);
+    }
+
+    public interface IMarketIngestionGateway
+    {
+        bool IsPythonAvailable { get; }
+
+        Task<IReadOnlyList<string>> GetActiveSymbolsAsync(
+            CancellationToken ct = default);
+
+        Task<MarketIngestionRunResult> RunIngestionBatchAsync(
+            IReadOnlyList<string> symbols,
+            string interval,
+            int lookbackDays,
+            string outRoot,
+            CancellationToken ct = default);
+
+        Task ApplyIngestionBatchAsync(
+            IReadOnlyList<string> batchSymbols,
+            string interval,
+            MarketIngestionRunResult runResult,
             CancellationToken ct = default);
     }
 
@@ -136,3 +171,36 @@ public sealed record TradeSnapshotDto(
     string? Notes,
     string? RawJson,
     int? PositionId);
+
+public sealed record MarketQuoteDto(
+    string Symbol,
+    double Price,
+    string TimestampUtc);
+
+public sealed record MarketCandlesDto(
+    string Symbol,
+    string Tf,
+    JsonElement Candles,
+    long? NextTo);
+
+public sealed record MarketCandlesQuery(
+    string Symbol,
+    string Tf,
+    string Range,
+    int Limit,
+    string? To);
+
+public sealed record MarketQuoteFetchResult(
+    bool Success,
+    MarketQuoteDto? Quote,
+    string? ErrorMessage);
+
+public sealed record MarketCandlesFetchResult(
+    bool Success,
+    MarketCandlesDto? Candles,
+    string? ErrorMessage);
+
+public sealed record MarketIngestionRunResult(
+    bool Success,
+    IngestionReport? Report,
+    string? ErrorMessage);

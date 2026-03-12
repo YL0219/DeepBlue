@@ -1,19 +1,21 @@
+"""
+math_manager.py — Router-facing adapter for the math domain.
+
+Dispatches 'indicators' action to the quant/ analysis package.
+Preserves the external contract expected by aether_router.py.
+"""
+
 import argparse
 import json
+import os
 import sys
 
 
-def _placeholder(action, symbol, days, timeframe):
-    return {
-        "ok": True,
-        "domain": "math",
-        "action": action,
-        "status": "placeholder",
-        "message": "Math manager wired successfully.",
-        "symbol": symbol,
-        "days": days,
-        "timeframe": timeframe,
-    }
+def _ensure_path():
+    """Ensure the package directory is on sys.path for relative imports."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    if d not in sys.path:
+        sys.path.insert(0, d)
 
 
 def handle_action(action, argv):
@@ -22,7 +24,7 @@ def handle_action(action, argv):
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--symbol", default="")
-    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--days", type=int, default=0)
     parser.add_argument("--timeframe", default="1d")
     args, _ = parser.parse_known_args(argv)
 
@@ -30,7 +32,22 @@ def handle_action(action, argv):
     if not symbol:
         return {"ok": False, "domain": "math", "action": action, "error": "--symbol is required."}
 
-    return _placeholder(action, symbol, max(args.days, 1), (args.timeframe or "1d").strip().lower())
+    days = max(args.days, 0)
+    timeframe = (args.timeframe or "1d").strip().lower()
+
+    try:
+        _ensure_path()
+        from quant.analysis import run_indicators
+        return run_indicators(symbol, timeframe, days)
+    except Exception as exc:
+        print(f"[math_manager] Error: {exc}", file=sys.stderr)
+        return {
+            "ok": False,
+            "domain": "math",
+            "action": action,
+            "symbol": symbol,
+            "error": str(exc),
+        }
 
 
 def main(argv=None):

@@ -11,6 +11,9 @@ public sealed class HeartbeatService : BackgroundService
         DayOfWeek.Friday
     };
 
+    // TODO: Wire macro basket symbols into Perception ingestion so Aether macro/ has fresh data.
+    internal static readonly string[] MacroBasketSymbols = { "SPY", "QQQ", "TLT", "GLD" };
+
     private readonly IAether _aether;
     private readonly ILogger<HeartbeatService> _logger;
 

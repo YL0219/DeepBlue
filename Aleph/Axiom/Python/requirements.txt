@@ -13,3 +13,7 @@ pyarrow>=14.0.0        # Parquet read/write engine
 feedparser>=6.0.10
 trafilatura>=1.8.0
 pydantic>=2.6.0
+
+# Aether quant engine (optional but preferred)
+pandas-ta>=0.3.14b     # Technical indicators — fallback logic exists if unavailable
+numpy>=1.24.0          # Numerical computation

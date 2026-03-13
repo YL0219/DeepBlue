@@ -39,7 +39,8 @@ builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<PythonPathResolver>();
 builder.Services.AddSingleton<PythonDispatcherService>();
 
-builder.Services.AddHostedService<MarketIngestionOrchestrator>();
+builder.Services.AddSingleton<IHomeostasis, Homeostasis>();
+builder.Services.AddScoped<IMarketIngestionCycle, MarketIngestionOrchestrator>();
 builder.Services.AddHostedService<HeartbeatService>();
 
 builder.Services

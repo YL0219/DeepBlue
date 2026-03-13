@@ -31,13 +31,16 @@ public class MarketIngestionOrchestrator : IMarketIngestionCycle
     private const string OutRoot = "data_lake/market/ohlcv";
 
     private readonly IAxiom _axiom;
+    private readonly IMarketStressDetector _stressDetector;
     private readonly ILogger<MarketIngestionOrchestrator> _logger;
 
     public MarketIngestionOrchestrator(
         IAxiom axiom,
+        IMarketStressDetector stressDetector,
         ILogger<MarketIngestionOrchestrator> logger)
     {
         _axiom = axiom;
+        _stressDetector = stressDetector;
         _logger = logger;
     }
 
@@ -90,7 +93,18 @@ public class MarketIngestionOrchestrator : IMarketIngestionCycle
                     batchSymbols, DefaultInterval, runResult, ct);
             }
 
-            _logger.LogInformation("[Ingestion] Cycle complete.");
+            _logger.LogInformation("[Ingestion] Cycle complete. Running reflexive stress evaluation...");
+
+            // Reflexive stress detection — runs after fresh data is available
+            try
+            {
+                await _stressDetector.EvaluateAsync(ct);
+            }
+            catch (Exception stressEx) when (stressEx is not OperationCanceledException)
+            {
+                // Stress detection failure must NOT crash the ingestion cycle
+                _logger.LogWarning(stressEx, "[Ingestion] Reflexive stress evaluation failed (non-fatal).");
+            }
         }
         catch (OperationCanceledException)
         {

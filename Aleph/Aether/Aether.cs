@@ -10,22 +10,26 @@ public sealed class Aether : IAether
         new("^[A-Z0-9][A-Z0-9.-]{0,14}$", RegexOptions.Compiled);
 
     private readonly IAxiom _axiom;
+    private readonly IStressInjector _stressInjector;
     private readonly ILogger<Aether> _logger;
 
     public IAether.IMathGateway Math { get; }
     public IAether.IMlGateway Ml { get; }
     public IAether.ISimGateway Sim { get; }
     public IAether.IMacroGateway Macro { get; }
+    public IAether.IRegulationGateway Regulation { get; }
 
-    public Aether(IAxiom axiom, ILogger<Aether> logger)
+    public Aether(IAxiom axiom, IStressInjector stressInjector, ILogger<Aether> logger)
     {
         _axiom = axiom;
+        _stressInjector = stressInjector;
         _logger = logger;
 
         Math = new MathGateway(this);
         Ml = new MlGateway(this);
         Sim = new SimGateway(this);
         Macro = new MacroGateway(this);
+        Regulation = new RegulationGateway(this);
     }
 
     private async Task<AetherJsonResult> RunAsync(
@@ -232,6 +236,70 @@ public sealed class Aether : IAether
             };
 
             return _root.RunAsync("macro", "regime", args, DefaultTimeoutMs, ct);
+        }
+    }
+
+    private sealed class RegulationGateway : IAether.IRegulationGateway
+    {
+        private readonly Aether _root;
+
+        public RegulationGateway(Aether root)
+        {
+            _root = root;
+        }
+
+        public Task<AdrenalineReleaseResult> ReleaseAdrenalineAsync(AdrenalineRequest request, CancellationToken ct = default)
+        {
+            if (request is null)
+                throw new ArgumentNullException(nameof(request));
+
+            if (string.IsNullOrWhiteSpace(request.Source))
+            {
+                return Task.FromResult(new AdrenalineReleaseResult
+                {
+                    Accepted = false,
+                    Source = "unknown",
+                    Severity = request.Severity,
+                    TimestampUtc = DateTimeOffset.UtcNow,
+                    RejectionReason = "Source must be provided."
+                });
+            }
+
+            // Build the PulseEnvelope via the ExternalStress factory
+            var mergedTags = new List<string> { "conscious", $"src:{request.Source}" };
+            if (request.Tags is not null)
+                mergedTags.AddRange(request.Tags);
+
+            var mergedMetrics = new Dictionary<string, double>();
+            if (request.Metrics is not null)
+            {
+                foreach (var kv in request.Metrics)
+                    mergedMetrics[kv.Key] = kv.Value;
+            }
+            if (request.TtlSeconds.HasValue)
+                mergedMetrics["ttl_seconds"] = request.TtlSeconds.Value;
+
+            var envelope = PulseEnvelope.ExternalStress(
+                source: $"aether_regulation/{request.Source}",
+                severity: request.Severity,
+                message: request.Message,
+                metrics: mergedMetrics.Count > 0 ? mergedMetrics : null,
+                tags: mergedTags);
+
+            var receipt = _root._stressInjector.InjectStress(envelope);
+
+            _root._logger.LogInformation(
+                "[Aether] Conscious adrenaline release. Source={Source}, Severity={Severity}, Accepted={Accepted}",
+                request.Source, request.Severity, receipt.Accepted);
+
+            return Task.FromResult(new AdrenalineReleaseResult
+            {
+                Accepted = receipt.Accepted,
+                Source = request.Source,
+                Severity = request.Severity,
+                TimestampUtc = receipt.TimestampUtc,
+                RejectionReason = receipt.RejectionReason
+            });
         }
     }
 }

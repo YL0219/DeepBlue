@@ -258,7 +258,8 @@ public sealed class Axiom : IAxiom
 
                 if (!result.Success)
                 {
-                    _root._logger.LogWarning("[Market] Python stderr: {Stderr}", result.Stderr);
+                    if (!string.IsNullOrWhiteSpace(result.Stderr))
+                        _root._logger.LogWarning("[Market] Python stderr: {Stderr}", result.Stderr);
                     return (false, string.Empty, $"Python exited with code {result.ExitCode}: {result.Stderr}");
                 }
 

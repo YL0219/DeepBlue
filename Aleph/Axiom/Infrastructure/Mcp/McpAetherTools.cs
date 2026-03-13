@@ -97,6 +97,58 @@ namespace Aleph
             return ToToolJson("aether_macro_check", result);
         }
 
+        [McpServerTool(Name = "aether_release_adrenaline", ReadOnly = false)]
+        [Description("Inject conscious stress/adrenaline into Aether's autonomic system. " +
+            "Use this when the AI detects danger, market panic, or needs to raise system alertness. " +
+            "Severity: 0=Normal, 1=Elevated, 2=Warning, 3=Critical.")]
+        public async Task<string> AetherReleaseAdrenaline(
+            [Description("Identifying source of the stress signal, e.g. 'arbiter', 'user', 'news_alert'.")]
+            string source,
+            [Description("Severity level: 0=Normal, 1=Elevated, 2=Warning, 3=Critical.")]
+            int severity,
+            [Description("Human-readable description of the stress trigger.")]
+            string message = "",
+            [Description("Optional comma-separated tags, e.g. 'market_crash,spy_drop'.")]
+            string tags = "",
+            [Description("Optional TTL in seconds. Natural decay is primary mechanism; TTL is advisory.")]
+            int ttl_seconds = 0,
+            CancellationToken ct = default)
+        {
+            // Validate severity range
+            var parsedSeverity = (PulseSeverity)Math.Clamp(severity, 0, 3);
+
+            if (string.IsNullOrWhiteSpace(source))
+            {
+                _logger.LogWarning("[MCP/Aether] aether_release_adrenaline: empty source rejected.");
+                return BuildErrorJson("Source must be provided.");
+            }
+
+            var parsedTags = string.IsNullOrWhiteSpace(tags)
+                ? null
+                : (IReadOnlyList<string>)tags.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .ToList();
+
+            var request = new AdrenalineRequest
+            {
+                Source = source.Trim(),
+                Severity = parsedSeverity,
+                Message = string.IsNullOrWhiteSpace(message) ? null : message.Trim(),
+                Tags = parsedTags,
+                TtlSeconds = ttl_seconds > 0 ? ttl_seconds : null
+            };
+
+            var result = await _aether.Regulation.ReleaseAdrenalineAsync(request, ct);
+
+            return System.Text.Json.JsonSerializer.Serialize(new
+            {
+                ok = result.Accepted,
+                source = result.Source,
+                severity = result.Severity.ToString(),
+                timestamp_utc = result.TimestampUtc.ToString("o"),
+                rejection_reason = result.RejectionReason
+            });
+        }
+
         private string ToToolJson(string toolName, AetherJsonResult result)
         {
             if (!string.IsNullOrWhiteSpace(result.PayloadJson))

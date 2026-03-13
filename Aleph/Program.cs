@@ -39,7 +39,13 @@ builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<PythonPathResolver>();
 builder.Services.AddSingleton<PythonDispatcherService>();
 
-builder.Services.AddSingleton<IHomeostasis, Homeostasis>();
+// Homeostasis singleton — serves both IHomeostasis (full read/write for Heartbeat)
+// and IStressInjector (narrow write-only for external domains).
+builder.Services.AddSingleton<Homeostasis>();
+builder.Services.AddSingleton<IHomeostasis>(sp => sp.GetRequiredService<Homeostasis>());
+builder.Services.AddSingleton<IStressInjector>(sp => sp.GetRequiredService<Homeostasis>());
+
+builder.Services.AddScoped<IMarketStressDetector, MarketStressDetector>();
 builder.Services.AddScoped<IMarketIngestionCycle, MarketIngestionOrchestrator>();
 builder.Services.AddHostedService<HeartbeatService>();
 

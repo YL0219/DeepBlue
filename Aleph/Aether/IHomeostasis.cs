@@ -35,6 +35,9 @@ public sealed record HomeostasisSnapshot
     public required DateTimeOffset LastUpdatedUtc { get; init; }
     public required IReadOnlyList<string> ActiveFlags { get; init; }
 
+    /// <summary>Recent distinct stress sources for observability.</summary>
+    public IReadOnlyList<string> RecentStressSources { get; init; } = Array.Empty<string>();
+
     public static HomeostasisSnapshot Default => new()
     {
         StressLevel = 0,
@@ -43,6 +46,7 @@ public sealed record HomeostasisSnapshot
         FailureStreak = 0,
         LastPulseDurationMs = 0,
         LastUpdatedUtc = DateTimeOffset.UtcNow,
-        ActiveFlags = Array.Empty<string>()
+        ActiveFlags = Array.Empty<string>(),
+        RecentStressSources = Array.Empty<string>()
     };
 }

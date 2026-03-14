@@ -6,6 +6,7 @@ public interface IAether
     IAether.IMlGateway Ml { get; }
     IAether.ISimGateway Sim { get; }
     IAether.IMacroGateway Macro { get; }
+    IAether.IRegulationGateway Regulation { get; }
 
     public interface IMathGateway
     {
@@ -27,6 +28,15 @@ public interface IAether
     public interface IMacroGateway
     {
         Task<AetherJsonResult> CheckRegimeAsync(MacroRegimeRequest request, CancellationToken ct = default);
+    }
+
+    public interface IRegulationGateway
+    {
+        /// <summary>
+        /// Conscious adrenaline release — Arbiter or MCP tools call this.
+        /// Builds PulseEnvelope.ExternalStress and injects through IStressInjector.
+        /// </summary>
+        Task<AdrenalineReleaseResult> ReleaseAdrenalineAsync(AdrenalineRequest request, CancellationToken ct = default);
     }
 }
 
@@ -60,3 +70,24 @@ public sealed record SimBacktestRequest(
 
 public sealed record MacroRegimeRequest(
     string Region = "global");
+
+// ─── Regulation DTOs ─────────────────────────────────────────────
+
+public sealed record AdrenalineRequest
+{
+    public required string Source { get; init; }
+    public required PulseSeverity Severity { get; init; }
+    public string? Message { get; init; }
+    public IReadOnlyList<string>? Tags { get; init; }
+    public IReadOnlyDictionary<string, double>? Metrics { get; init; }
+    public int? TtlSeconds { get; init; }
+}
+
+public sealed record AdrenalineReleaseResult
+{
+    public required bool Accepted { get; init; }
+    public required string Source { get; init; }
+    public required PulseSeverity Severity { get; init; }
+    public required DateTimeOffset TimestampUtc { get; init; }
+    public string? RejectionReason { get; init; }
+};

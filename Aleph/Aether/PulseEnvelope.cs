@@ -41,8 +41,19 @@ public sealed record PulseEnvelope
         string source,
         PulseSeverity severity,
         string? message = null,
-        IReadOnlyDictionary<string, double>? metrics = null)
+        IReadOnlyDictionary<string, double>? metrics = null,
+        IReadOnlyList<string>? tags = null)
     {
+        var finalTags = new List<string> { "external" };
+        if (tags is not null)
+        {
+            foreach (var t in tags)
+            {
+                if (!finalTags.Contains(t))
+                    finalTags.Add(t);
+            }
+        }
+
         return new PulseEnvelope
         {
             Source = source,
@@ -51,7 +62,7 @@ public sealed record PulseEnvelope
             Severity = severity,
             Message = message,
             Metrics = metrics,
-            Tags = new[] { "external" }
+            Tags = finalTags
         };
     }
 }

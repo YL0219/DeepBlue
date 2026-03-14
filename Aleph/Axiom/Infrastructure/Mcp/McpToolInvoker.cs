@@ -65,7 +65,10 @@ namespace Aleph
                     Handler: InvokeAetherSimRunAsync),
                 ["aether_macro_check"] = new(
                     IsStateChanging: false,
-                    Handler: InvokeAetherMacroCheckAsync)
+                    Handler: InvokeAetherMacroCheckAsync),
+                ["aether_release_adrenaline"] = new(
+                    IsStateChanging: true,
+                    Handler: InvokeAetherReleaseAdrenalineAsync)
             };
 
             _routes = routes;
@@ -341,6 +344,35 @@ namespace Aleph
                 ? McpToolResult.Success(content)
                 : McpToolResult.Failure(content);
         }
+
+        private async Task<McpToolResult> InvokeAetherReleaseAdrenalineAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "source", out string source, out string sourceErr))
+                return BuildInvokerFailure(sourceErr);
+
+            if (!TryGetRequiredInt(root, "severity", out int severity, out string sevErr))
+                return BuildInvokerFailure(sevErr);
+
+            string message = TryGetOptionalString(root, "message") ?? "";
+            string tags = TryGetOptionalString(root, "tags") ?? "";
+
+            int ttlSeconds = 0;
+            if (root.TryGetProperty("ttl_seconds", out var ttlProp))
+            {
+                if (!TryReadInt(ttlProp, out ttlSeconds))
+                    return BuildInvokerFailure("Argument 'ttl_seconds' must be an integer.");
+            }
+
+            var aetherTools = ResolveTool<McpAetherTools>();
+            string content = await aetherTools.AetherReleaseAdrenaline(
+                source, severity, message, tags, ttlSeconds, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
+
         // ─── Argument Parsing Helpers ─────────────────────────────────────
 
         private static bool TryGetRequiredInt(

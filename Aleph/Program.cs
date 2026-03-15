@@ -61,6 +61,9 @@ builder.Services.AddHostedService<AutonomicPersistenceService>();
 builder.Services.AddSingleton<MetabolicArtifactWriter>();
 builder.Services.AddHostedService<LiverService>();
 
+// ML Cortex — predictive organ. Consumes MetabolicEvent → PredictionEvent.
+builder.Services.AddHostedService<MlCortexService>();
+
 builder.Services
     .AddMcpServer(options =>
     {

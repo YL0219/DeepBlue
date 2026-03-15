@@ -31,15 +31,18 @@ public class MarketIngestionOrchestrator : IMarketIngestionCycle
     private const string OutRoot = "data_lake/market/ohlcv";
 
     private readonly IAxiom _axiom;
+    private readonly IAlephBus _bus;
     private readonly IMarketStressDetector _stressDetector;
     private readonly ILogger<MarketIngestionOrchestrator> _logger;
 
     public MarketIngestionOrchestrator(
         IAxiom axiom,
+        IAlephBus bus,
         IMarketStressDetector stressDetector,
         ILogger<MarketIngestionOrchestrator> logger)
     {
         _axiom = axiom;
+        _bus = bus;
         _stressDetector = stressDetector;
         _logger = logger;
     }
@@ -91,6 +94,10 @@ public class MarketIngestionOrchestrator : IMarketIngestionCycle
 
                 await _axiom.MarketIngestion.ApplyIngestionBatchAsync(
                     batchSymbols, DefaultInterval, runResult, ct);
+
+                // ── Publish MarketDataEvent for each ingested symbol ──
+                // This connects the background ingestion vein to the Liver and ML Cortex.
+                await PublishIngestionEventsAsync(runResult, ct);
             }
 
             _logger.LogInformation("[Ingestion] Cycle complete. Running reflexive stress evaluation...");
@@ -114,6 +121,43 @@ public class MarketIngestionOrchestrator : IMarketIngestionCycle
         {
             _logger.LogError(ex, "[Ingestion] Cycle failed.");
             throw; // Let HeartbeatService catch and track in Homeostasis
+        }
+    }
+
+    /// <summary>
+    /// Publish a MarketDataEvent for each successfully ingested symbol.
+    /// This is the missing vein — connects background ingestion to the Liver and ML Cortex.
+    /// </summary>
+    private async Task PublishIngestionEventsAsync(MarketIngestionRunResult runResult, CancellationToken ct)
+    {
+        if (runResult.Report?.Results is null)
+            return;
+
+        foreach (var result in runResult.Report.Results)
+        {
+            var evt = new MarketDataEvent
+            {
+                OccurredAtUtc = DateTimeOffset.UtcNow,
+                Source = "Ingestion",
+                Kind = "market_data",
+                Severity = result.IsSuccess ? PulseSeverity.Normal : PulseSeverity.Warning,
+                Symbol = result.Symbol,
+                Interval = string.IsNullOrWhiteSpace(result.Interval) ? DefaultInterval : result.Interval,
+                Success = result.IsSuccess,
+                SourceKind = "background_ingestion",
+                RowsWritten = result.IsSuccess ? result.RowsWritten : null,
+                ParquetPath = result.IsSuccess ? result.ParquetPath : null,
+                ErrorMessage = result.Error?.Message,
+            };
+
+            await _bus.PublishAsync(evt, ct);
+
+            if (result.IsSuccess)
+            {
+                _logger.LogDebug(
+                    "[Ingestion] Published MarketDataEvent for {Symbol}/{Interval} ({Rows} rows).",
+                    result.Symbol, result.Interval, result.RowsWritten);
+            }
         }
     }
 }

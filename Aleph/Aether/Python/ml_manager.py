@@ -18,6 +18,11 @@ def _ok(action, symbol, extra=None):
 
 
 def handle_action(action, argv):
+    # ── Cortex actions (new Phase 8 brain) ──
+    if action in ("cortex_predict", "cortex_train", "cortex_status"):
+        return _handle_cortex(action, argv)
+
+    # ── Legacy ML actions ──
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--symbol", default="")
     parser.add_argument("--horizonDays", type=int, default=5)
@@ -39,6 +44,61 @@ def handle_action(action, argv):
         return _ok(action, symbol, {"epochs": max(args.epochs, 1)})
 
     return {"ok": False, "domain": "ml", "action": action, "error": "Unknown ml action."}
+
+
+def _handle_cortex(action, argv):
+    """Route cortex actions to the ml.ml_cortex module."""
+    import os
+
+    # Ensure the ml package is importable
+    router_dir = os.path.dirname(os.path.abspath(__file__))
+    if router_dir not in sys.path:
+        sys.path.insert(0, router_dir)
+
+    from ml.ml_cortex import cortex_predict, cortex_train, cortex_status
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--symbol", default="")
+    parser.add_argument("--interval", default="1d")
+    parser.add_argument("--horizon", default="1d")
+    parser.add_argument("--asof", default="")
+    parser.add_argument("--payload", default="{}")
+    parser.add_argument("--max-samples", type=int, default=100)
+    args, _ = parser.parse_known_args(argv)
+
+    symbol = (args.symbol or "").strip().upper()
+    if not symbol:
+        return {"ok": False, "domain": "ml", "action": action, "error": "--symbol is required."}
+
+    if action == "cortex_predict":
+        # Parse the metabolic payload JSON
+        try:
+            payload = json.loads(args.payload)
+        except json.JSONDecodeError as ex:
+            return {"ok": False, "domain": "ml", "action": action, "error": f"Invalid payload JSON: {ex}"}
+
+        return cortex_predict(
+            symbol=symbol,
+            interval=args.interval,
+            horizon=args.horizon,
+            asof_utc=args.asof,
+            payload=payload,
+        )
+
+    elif action == "cortex_train":
+        return cortex_train(
+            symbol=symbol,
+            horizon=args.horizon,
+            max_samples=max(args.max_samples, 1),
+        )
+
+    elif action == "cortex_status":
+        return cortex_status(
+            symbol=symbol,
+            horizon=args.horizon,
+        )
+
+    return {"ok": False, "domain": "ml", "action": action, "error": "Unknown cortex action."}
 
 
 def main(argv=None):

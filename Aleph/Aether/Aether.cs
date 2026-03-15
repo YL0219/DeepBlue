@@ -182,6 +182,65 @@ public sealed class Aether : IAether
 
             return _root.RunAsync("ml", "status", args, DefaultTimeoutMs, ct);
         }
+
+        public Task<AetherJsonResult> CortexPredictAsync(MlCortexPredictRequest request, CancellationToken ct = default)
+        {
+            if (request is null)
+                throw new ArgumentNullException(nameof(request));
+
+            var symbol = NormalizeSymbol(request.Symbol);
+            if (string.IsNullOrWhiteSpace(symbol))
+                return Task.FromResult(new AetherJsonResult(false, string.Empty, "Invalid symbol format.", -1, false));
+
+            var args = new List<string>
+            {
+                "--symbol", symbol,
+                "--interval", string.IsNullOrWhiteSpace(request.Interval) ? "1d" : request.Interval.Trim().ToLowerInvariant(),
+                "--horizon", string.IsNullOrWhiteSpace(request.ActiveHorizon) ? "1d" : request.ActiveHorizon.Trim().ToLowerInvariant(),
+                "--asof", request.AsOfUtc ?? DateTimeOffset.UtcNow.ToString("o"),
+                "--payload", request.MetabolicPayloadJson ?? "{}"
+            };
+
+            return _root.RunAsync("ml", "cortex_predict", args, DefaultTimeoutMs, ct);
+        }
+
+        public Task<AetherJsonResult> CortexTrainAsync(MlCortexTrainRequest request, CancellationToken ct = default)
+        {
+            if (request is null)
+                throw new ArgumentNullException(nameof(request));
+
+            var symbol = NormalizeSymbol(request.Symbol);
+            if (string.IsNullOrWhiteSpace(symbol))
+                return Task.FromResult(new AetherJsonResult(false, string.Empty, "Invalid symbol format.", -1, false));
+
+            var args = new List<string>
+            {
+                "--symbol", symbol,
+                "--horizon", string.IsNullOrWhiteSpace(request.ActiveHorizon) ? "1d" : request.ActiveHorizon.Trim().ToLowerInvariant(),
+                "--max-samples", System.Math.Clamp(request.MaxSamples, 1, 10000).ToString()
+            };
+
+            return _root.RunAsync("ml", "cortex_train", args, 120_000, ct);
+        }
+
+        public Task<AetherJsonResult> CortexStatusAsync(MlCortexStatusRequest request, CancellationToken ct = default)
+        {
+            request ??= new MlCortexStatusRequest();
+
+            var args = new List<string>
+            {
+                "--horizon", string.IsNullOrWhiteSpace(request.ActiveHorizon) ? "1d" : request.ActiveHorizon.Trim().ToLowerInvariant()
+            };
+
+            var symbol = NormalizeSymbol(request.Symbol ?? string.Empty);
+            if (!string.IsNullOrWhiteSpace(symbol))
+            {
+                args.Add("--symbol");
+                args.Add(symbol);
+            }
+
+            return _root.RunAsync("ml", "cortex_status", args, DefaultTimeoutMs, ct);
+        }
     }
 
     private sealed class SimGateway : IAether.ISimGateway

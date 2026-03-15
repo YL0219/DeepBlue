@@ -18,6 +18,23 @@ public interface IAether
         Task<AetherJsonResult> PredictAsync(MlPredictRequest request, CancellationToken ct = default);
         Task<AetherJsonResult> TrainAsync(MlTrainRequest request, CancellationToken ct = default);
         Task<AetherJsonResult> GetStatusAsync(MlStatusRequest request, CancellationToken ct = default);
+
+        /// <summary>
+        /// Cortex real-time prediction from a metabolic payload.
+        /// Lightweight path — always available, even during cold start.
+        /// </summary>
+        Task<AetherJsonResult> CortexPredictAsync(MlCortexPredictRequest request, CancellationToken ct = default);
+
+        /// <summary>
+        /// Cortex incremental training update. Heavier path — should only be
+        /// called during Calm/DeepWork windows via Homeostasis gating.
+        /// </summary>
+        Task<AetherJsonResult> CortexTrainAsync(MlCortexTrainRequest request, CancellationToken ct = default);
+
+        /// <summary>
+        /// Cortex status — model state, sample counts, version info.
+        /// </summary>
+        Task<AetherJsonResult> CortexStatusAsync(MlCortexStatusRequest request, CancellationToken ct = default);
     }
 
     public interface ISimGateway
@@ -91,3 +108,37 @@ public sealed record AdrenalineReleaseResult
     public required DateTimeOffset TimestampUtc { get; init; }
     public string? RejectionReason { get; init; }
 };
+
+// ─── ML Cortex DTOs ─────────────────────────────────────────────
+
+/// <summary>
+/// Request for Cortex real-time prediction from a MetabolicEvent payload.
+/// The payload JSON is the serialized metabolic feature snapshot.
+/// </summary>
+public sealed record MlCortexPredictRequest
+{
+    public required string Symbol { get; init; }
+    public required string Interval { get; init; }
+    public required string ActiveHorizon { get; init; }
+    public required string AsOfUtc { get; init; }
+    public required string MetabolicPayloadJson { get; init; }
+}
+
+/// <summary>
+/// Request for Cortex incremental training update.
+/// </summary>
+public sealed record MlCortexTrainRequest
+{
+    public required string Symbol { get; init; }
+    public string ActiveHorizon { get; init; } = "1d";
+    public int MaxSamples { get; init; } = 100;
+}
+
+/// <summary>
+/// Request for Cortex status information.
+/// </summary>
+public sealed record MlCortexStatusRequest
+{
+    public string? Symbol { get; init; }
+    public string ActiveHorizon { get; init; } = "1d";
+}

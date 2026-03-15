@@ -50,7 +50,7 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("[Liver] Metabolic organ starting. Subscribing to bloodstream...");
+        _logger.LogDebug("[Liver] Metabolic organ starting. Subscribing to bloodstream...");
 
         var reader = _bus.Subscribe(
             OrganName,
@@ -58,7 +58,7 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
 
         _isActive = true;
 
-        _logger.LogInformation("[Liver] Active. Awaiting MarketDataEvent blood cells.");
+        _logger.LogDebug("[Liver] Active. Awaiting MarketDataEvent blood cells.");
 
         try
         {
@@ -121,7 +121,7 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
             return;
         }
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "[Liver] Digesting {Symbol}/{Interval} (source event {EventId}).",
             mde.Symbol, mde.Interval, mde.EventId);
 
@@ -220,9 +220,9 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
             await _bus.PublishAsync(finalEvent, ct);
 
             _logger.LogInformation(
-                "[Liver] Digested {Symbol}/{Interval}. Bias={Bias}, Confidence={Confidence:F2}, Rows={Rows}. Artifact={Path}",
+                "[Liver] {Symbol}/{Interval} → Bias={Bias} Conf={Confidence:F2} Rows={Rows}",
                 mde.Symbol, mde.Interval, finalEvent.Bias, finalEvent.Confidence,
-                finalEvent.RowCount, artifactPath ?? "none");
+                finalEvent.RowCount);
         }
     }
 

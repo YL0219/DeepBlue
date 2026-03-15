@@ -56,7 +56,7 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("[MlCortex] Predictive organ starting. Subscribing to bloodstream...");
+        _logger.LogDebug("[MlCortex] Predictive organ starting. Subscribing to bloodstream...");
 
         var reader = _bus.Subscribe(
             OrganName,
@@ -64,7 +64,7 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
 
         _isActive = true;
 
-        _logger.LogInformation("[MlCortex] Active. Horizon={Horizon}. Awaiting MetabolicEvent blood cells.", ActiveHorizon);
+        _logger.LogDebug("[MlCortex] Active. Horizon={Horizon}. Awaiting MetabolicEvent blood cells.", ActiveHorizon);
 
         try
         {
@@ -169,12 +169,10 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
         await _bus.PublishAsync(predictionEvent, ct);
 
         _logger.LogInformation(
-            "[MlCortex] Prediction for {Symbol}/{Interval}: Class={Class}, Confidence={Confidence:F3}, " +
-            "Tendency={Tendency:F3}, ModelState={State}, Samples={Samples}",
+            "[MlCortex] {Symbol}/{Interval} → {Class} Conf={Confidence:F3} Tend={Tendency:F3} ({State})",
             me.Symbol, me.Interval,
             predictionEvent.PredictedClass, predictionEvent.Confidence,
-            predictionEvent.ActionTendency, predictionEvent.ModelState,
-            predictionEvent.TrainedSamples);
+            predictionEvent.ActionTendency, predictionEvent.ModelState);
     }
 
     /// <summary>

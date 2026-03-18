@@ -67,3 +67,54 @@ public sealed record MarketDataEvent : AlephEvent
     public double? LatestPrice { get; init; }
     public string? QuoteTimestampUtc { get; init; }
 }
+
+/// <summary>
+/// Blood cell summarizing one completed Sleep Cycle (resolve → train).
+/// Published by SleepCycleService at the end of each cycle for observability.
+/// </summary>
+public sealed record SleepCycleSummaryEvent : AlephEvent
+{
+    // Identity
+    public required string Symbol { get; init; }
+    public required string Horizon { get; init; }
+    public required long DurationMs { get; init; }
+
+    // Phase results
+    public bool StatusOk { get; init; }
+    public bool ResolveOk { get; init; }
+    public bool TrainOk { get; init; }
+    public string? SkipReason { get; init; }
+
+    // Pending / resolved counts
+    public int PendingCount { get; init; }
+    public int PendingEligible { get; init; }
+    public int PendingBlocked { get; init; }
+    public int NewlyResolved { get; init; }
+    public int Deferred { get; init; }
+    public int Expired { get; init; }
+    public int Errored { get; init; }
+
+    // Training
+    public int SamplesFitted { get; init; }
+    public int FreshCount { get; init; }
+    public int ReplayCount { get; init; }
+    public string? TrainingGate { get; init; }
+    public string? TrainingGateReason { get; init; }
+    public int CursorSequence { get; init; }
+
+    // Model
+    public string? ModelState { get; init; }
+    public int TrainedSamples { get; init; }
+
+    // Quality metrics
+    public double ResolveAccuracy { get; init; }
+    public double ResolveMeanBrier { get; init; }
+    public string? ClassSkewWarning { get; init; }
+    public IReadOnlyList<string>? DriftFlags { get; init; }
+    public IReadOnlyDictionary<string, int>? ResolvedClassDistribution { get; init; }
+    public IReadOnlyDictionary<string, int>? TrainClassDistribution { get; init; }
+
+    // Homeostasis at cycle time
+    public double StressLevel { get; init; }
+    public double FatigueLevel { get; init; }
+}

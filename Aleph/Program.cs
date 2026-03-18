@@ -64,6 +64,9 @@ builder.Services.AddHostedService<LiverService>();
 // ML Cortex — predictive organ. Consumes MetabolicEvent → PredictionEvent.
 builder.Services.AddHostedService<MlCortexService>();
 
+// Sleep Cycle — offline learning orchestrator. Resolve → Train in calm windows.
+builder.Services.AddHostedService<SleepCycleService>();
+
 builder.Services
     .AddMcpServer(options =>
     {

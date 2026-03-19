@@ -42,6 +42,12 @@ public interface IAether
         /// Should only be called during sleep/calm windows.
         /// </summary>
         Task<AetherJsonResult> CortexResolveAsync(MlCortexResolveRequest request, CancellationToken ct = default);
+
+        /// <summary>
+        /// Cortex evaluate — run offline challenger-vs-incumbent policy comparison
+        /// against resolved truth archive. Returns scorecards and promotion decisions.
+        /// </summary>
+        Task<AetherJsonResult> CortexEvaluateAsync(MlCortexEvaluateRequest request, CancellationToken ct = default);
     }
 
     public interface ISimGateway
@@ -158,4 +164,18 @@ public sealed record MlCortexResolveRequest
     public required string Symbol { get; init; }
     public string ActiveHorizon { get; init; } = "1d";
     public string Interval { get; init; } = "1h";
+}
+
+/// <summary>
+/// Request for Cortex evaluate — offline challenger-vs-incumbent comparison.
+/// </summary>
+public sealed record MlCortexEvaluateRequest
+{
+    public required string Symbol { get; init; }
+    public string ActiveHorizon { get; init; } = "1d";
+    /// <summary>
+    /// Optional JSON array of challenger specs. If empty, uses default challengers.
+    /// Each entry: { "name": "...", "label_policy": {...}, "training_policy": {...} }
+    /// </summary>
+    public string ChallengersJson { get; init; } = "";
 }

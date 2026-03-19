@@ -1,8 +1,8 @@
 """
 prediction_formatter.py — Normalized output contract for the Python brain.
 
-v3: Expanded for Phase 9 learning loop — adds format_resolve and format_controlled_train
-alongside the existing predict/status/train formatters.
+v4: Expanded for Phase 9.1 — adds scorecard summaries to resolve/status,
+    plus format_evaluation for challenger comparison results.
 
 All functions return a dict that gets serialized to JSON by the router.
 Every output has {ok, domain, action} as the root envelope.
@@ -118,9 +118,11 @@ def format_status(
     cursor_sequence: int = 0,
     total_samples_ever_trained: int = 0,
     active_policies: dict | None = None,
+    # v4 fields (Phase 9.1)
+    rolling_scorecard: dict | None = None,
 ) -> dict:
-    """Build the normalized status output dict."""
-    return {
+    """Build the normalized status output dict with optional rolling scorecard."""
+    result = {
         "ok": True,
         "domain": "ml",
         "action": "cortex_status",
@@ -142,6 +144,9 @@ def format_status(
         "total_samples_ever_trained": total_samples_ever_trained,
         "active_policies": active_policies or {},
     }
+    if rolling_scorecard is not None:
+        result["rolling_scorecard"] = rolling_scorecard
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -154,9 +159,10 @@ def format_resolve(
     resolution_summary: dict,
     pending_rewrite_result: dict | None = None,
     warnings: list[str] | None = None,
+    cycle_scorecard: dict | None = None,
 ) -> dict:
-    """Build the normalized resolve output dict."""
-    return {
+    """Build the normalized resolve output dict with optional cycle-level scorecard."""
+    result = {
         "ok": True,
         "domain": "ml",
         "action": "cortex_resolve",
@@ -166,6 +172,9 @@ def format_resolve(
         "pending_rewrite": pending_rewrite_result or {},
         "warnings": warnings or [],
     }
+    if cycle_scorecard is not None:
+        result["cycle_scorecard"] = cycle_scorecard
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -217,4 +226,26 @@ def format_train_result(
         "model_state": model_state,
         "model_version": model_version,
         "trained_samples": trained_samples,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# EVALUATION OUTPUT (Phase 9.1)
+# ═══════════════════════════════════════════════════════════════════
+
+def format_evaluation(
+    symbol: str,
+    horizon: str,
+    evaluation_result: dict,
+    warnings: list[str] | None = None,
+) -> dict:
+    """Build the normalized challenger evaluation output dict."""
+    return {
+        "ok": True,
+        "domain": "ml",
+        "action": "cortex_evaluate",
+        "symbol": symbol,
+        "horizon": horizon,
+        "evaluation": evaluation_result,
+        "warnings": warnings or [],
     }

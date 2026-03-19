@@ -1,11 +1,12 @@
 """
 ml_cortex.py — Main orchestrator for the ML Cortex Python brain.
 
-v3: Full learning-loop with four verbs:
-  - cortex_predict  — real-time inference (always available, even cold start)
-  - cortex_resolve  — resolve pending predictions against parquet truth
-  - cortex_train    — cursor-aware policy-driven incremental training
-  - cortex_status   — model/memory/cursor diagnostics
+v4: Phase 9.1 — adds scorecard integration and challenger evaluation:
+  - cortex_predict   — real-time inference (always available, even cold start)
+  - cortex_resolve   — resolve pending + cycle-level scorecard
+  - cortex_train     — cursor-aware policy-driven incremental training
+  - cortex_status    — diagnostics + rolling scorecard summary
+  - cortex_evaluate  — offline challenger-vs-incumbent comparison
 
 All stdout output = exactly one JSON object.
 All logs go to stderr.
@@ -45,7 +46,11 @@ from .prediction_formatter import (
     format_resolve,
     format_controlled_train,
     format_train_result,
+    format_evaluation,
 )
+from .scorecard import compute_scorecard, compute_rolling_scorecard, DEFAULT_SCORECARD_POLICY
+from .challenger_runner import run_challenger_comparison, build_default_challengers, ChallengerSpec
+from .promotion import DEFAULT_PROMOTION_POLICY
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -298,12 +303,26 @@ def cortex_resolve(symbol: str, horizon: str, interval: str = "1h") -> dict:
 
     warnings.extend(result.warnings)
 
+    # ── Compute cycle-level scorecard over newly resolved batch ──
+    cycle_scorecard = None
+    if result.resolved:
+        try:
+            cycle_scorecard = compute_scorecard(result.resolved, DEFAULT_SCORECARD_POLICY)
+            print(
+                f"[MlCortex] Cycle scorecard: brier={cycle_scorecard.get('mean_brier_score')}, "
+                f"acc={cycle_scorecard.get('accuracy')}, warnings={cycle_scorecard.get('warning_count', 0)}",
+                file=sys.stderr,
+            )
+        except Exception as ex:
+            warnings.append(f"scorecard_error:{ex}")
+
     return format_resolve(
         symbol=symbol,
         horizon=horizon,
         resolution_summary=summary,
         pending_rewrite_result=rewrite_result,
         warnings=warnings,
+        cycle_scorecard=cycle_scorecard,
     )
 
 
@@ -410,7 +429,7 @@ def cortex_train(symbol: str, horizon: str, max_samples: int = 200) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 
 def cortex_status(symbol: str, horizon: str) -> dict:
-    """Get Cortex model/memory/cursor status."""
+    """Get Cortex model/memory/cursor status with rolling scorecard."""
     model = load_model(symbol, horizon)
     cursor = load_cursor(symbol, horizon)
 
@@ -422,6 +441,21 @@ def cortex_status(symbol: str, horizon: str) -> dict:
     class_dist = {}
     if hasattr(model, "class_distribution"):
         class_dist = model.class_distribution()
+
+    # ── Compute rolling scorecard over resolved history ──
+    rolling_sc = None
+    if rc > 0:
+        try:
+            resolved = load_resolved_samples(symbol, horizon)
+            if resolved:
+                rolling_sc = compute_rolling_scorecard(resolved, DEFAULT_SCORECARD_POLICY)
+                print(
+                    f"[MlCortex] Rolling scorecard ({rolling_sc.get('window_actual', 0)} samples): "
+                    f"brier={rolling_sc.get('mean_brier_score')}, acc={rolling_sc.get('accuracy')}",
+                    file=sys.stderr,
+                )
+        except Exception as ex:
+            print(f"[MlCortex] Rolling scorecard error: {ex}", file=sys.stderr)
 
     return format_status(
         symbol=symbol,
@@ -441,6 +475,104 @@ def cortex_status(symbol: str, horizon: str) -> dict:
         cursor_sequence=cursor.sequence,
         total_samples_ever_trained=cursor.total_samples_ever,
         active_policies=get_active_policies(),
+        rolling_scorecard=rolling_sc,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# VERB 5: EVALUATE (offline challenger comparison) — Phase 9.1
+# ═══════════════════════════════════════════════════════════════════
+
+def cortex_evaluate(symbol: str, horizon: str, challengers_json: str = "") -> dict:
+    """
+    Run offline challenger-vs-incumbent evaluation against resolved history.
+
+    If no challengers_json is provided, uses the default challenger set
+    covering label threshold and replay ratio variations.
+    """
+    warnings: list[str] = []
+
+    # ── Load resolved history ──
+    resolved = load_resolved_samples(symbol, horizon)
+    if not resolved:
+        return format_evaluation(
+            symbol=symbol, horizon=horizon,
+            evaluation_result={
+                "ok": False,
+                "error": "no_resolved_history",
+                "sample_count": 0,
+            },
+            warnings=["no_resolved_history"],
+        )
+
+    print(
+        f"[MlCortex] Evaluate {symbol}/{horizon} — {len(resolved)} resolved samples",
+        file=sys.stderr,
+    )
+
+    # ── Parse challenger specs or use defaults ──
+    challengers = []
+    if challengers_json:
+        try:
+            import json
+            specs = json.loads(challengers_json)
+            if isinstance(specs, list):
+                for spec in specs:
+                    lp = None
+                    tp = None
+                    if "label_policy" in spec:
+                        from .policies import LabelPolicy
+                        lp = LabelPolicy.from_dict(spec["label_policy"])
+                    if "training_policy" in spec:
+                        from .policies import TrainingPolicy
+                        tp = TrainingPolicy.from_dict(spec["training_policy"])
+                    challengers.append(ChallengerSpec(
+                        name=spec.get("name", "unnamed"),
+                        label_policy=lp,
+                        training_policy=tp,
+                        description=spec.get("description", ""),
+                    ))
+        except Exception as ex:
+            warnings.append(f"challengers_parse_error:{ex}")
+
+    if not challengers:
+        challengers = build_default_challengers()
+        print(
+            f"[MlCortex] Using {len(challengers)} default challengers",
+            file=sys.stderr,
+        )
+
+    # ── Run comparison ──
+    try:
+        result = run_challenger_comparison(
+            resolved_samples=resolved,
+            challengers=challengers,
+            incumbent_label_policy=DEFAULT_LABEL_POLICY,
+            incumbent_training_policy=DEFAULT_TRAINING_POLICY,
+            scorecard_policy=DEFAULT_SCORECARD_POLICY,
+            promotion_policy=DEFAULT_PROMOTION_POLICY,
+        )
+    except Exception as ex:
+        return format_evaluation(
+            symbol=symbol, horizon=horizon,
+            evaluation_result={"ok": False, "error": str(ex)},
+            warnings=[f"evaluation_error:{ex}"],
+        )
+
+    summary = result.get("summary", {})
+    print(
+        f"[MlCortex] Evaluation complete: "
+        f"promote={summary.get('promote', 0)}, "
+        f"reject={summary.get('reject', 0)}, "
+        f"inconclusive={summary.get('inconclusive', 0)}, "
+        f"best={summary.get('best_challenger')}",
+        file=sys.stderr,
+    )
+
+    return format_evaluation(
+        symbol=symbol, horizon=horizon,
+        evaluation_result=result,
+        warnings=warnings,
     )
 
 

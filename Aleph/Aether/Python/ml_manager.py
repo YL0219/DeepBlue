@@ -19,7 +19,7 @@ def _ok(action, symbol, extra=None):
 
 def handle_action(action, argv):
     # ── Cortex actions (Phase 8+ brain) ──
-    if action in ("cortex_predict", "cortex_train", "cortex_status", "cortex_resolve"):
+    if action in ("cortex_predict", "cortex_train", "cortex_status", "cortex_resolve", "cortex_evaluate"):
         return _handle_cortex(action, argv)
 
     # ── Legacy ML actions ──
@@ -55,7 +55,7 @@ def _handle_cortex(action, argv):
     if router_dir not in sys.path:
         sys.path.insert(0, router_dir)
 
-    from ml.ml_cortex import cortex_predict, cortex_train, cortex_status, cortex_resolve
+    from ml.ml_cortex import cortex_predict, cortex_train, cortex_status, cortex_resolve, cortex_evaluate
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--symbol", default="")
@@ -64,6 +64,7 @@ def _handle_cortex(action, argv):
     parser.add_argument("--asof", default="")
     parser.add_argument("--payload", default="{}")
     parser.add_argument("--max-samples", type=int, default=100)
+    parser.add_argument("--challengers", default="")
     args, _ = parser.parse_known_args(argv)
 
     symbol = (args.symbol or "").strip().upper()
@@ -103,6 +104,13 @@ def _handle_cortex(action, argv):
         return cortex_status(
             symbol=symbol,
             horizon=args.horizon,
+        )
+
+    elif action == "cortex_evaluate":
+        return cortex_evaluate(
+            symbol=symbol,
+            horizon=args.horizon,
+            challengers_json=args.challengers,
         )
 
     return {"ok": False, "domain": "ml", "action": action, "error": "Unknown cortex action."}

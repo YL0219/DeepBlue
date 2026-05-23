@@ -1,5 +1,4 @@
 using Aleph;
-using Microsoft.EntityFrameworkCore;
 using Serilog;
 
 Log.Logger = new LoggerConfiguration()
@@ -22,83 +21,16 @@ builder.Host.UseSerilog();
 
 builder.Services.AddControllers();
 
-var sqliteConnectionString =
-    builder.Configuration.GetConnectionString("Aleph")
-    ?? builder.Configuration.GetConnectionString("DefaultConnection")
-    ?? "Data Source=deepblue.db";
-
-// AddDbContextFactory automatically registers both the Singleton Factory 
-// AND the Scoped DbContext for your legacy controllers.
-builder.Services.AddDbContextFactory<AppDbContext>(options =>
-    options.UseSqlite(sqliteConnectionString));
-
-builder.Services.AddScoped<TradingService>();
-
-builder.Services.AddMemoryCache();
-
-builder.Services.AddSingleton<PythonPathResolver>();
-builder.Services.AddSingleton<PythonDispatcherService>();
-
-// AlephBus — singleton in-memory fan-out event bus (the Veins).
-builder.Services.AddSingleton<AlephBus>();
-builder.Services.AddSingleton<IAlephBus>(sp => sp.GetRequiredService<AlephBus>());
-
-// Homeostasis singleton — serves both IHomeostasis (full read/write for Heartbeat)
-// and IStressInjector (narrow write-only for external domains).
-// Now receives IAlephBus to publish circulatory events.
-builder.Services.AddSingleton<Homeostasis>();
-builder.Services.AddSingleton<IHomeostasis>(sp => sp.GetRequiredService<Homeostasis>());
-builder.Services.AddSingleton<IStressInjector>(sp => sp.GetRequiredService<Homeostasis>());
-
-builder.Services.AddScoped<IMarketStressDetector, MarketStressDetector>();
-builder.Services.AddScoped<IMarketIngestionCycle, MarketIngestionOrchestrator>();
-builder.Services.AddHostedService<HeartbeatService>();
-
-// Kidneys — background persistence consumer for autonomic/heartbeat events.
-builder.Services.AddHostedService<AutonomicPersistenceService>();
-
-// Perception — cached accessor for macro context (proxies, calendar, headlines).
-builder.Services.AddSingleton<PerceptionSnapshotCache>();
-
-// Quarantine — isolation ward for corrupted blood cells rejected by the immune system.
-builder.Services.AddSingleton<Quarantine>();
-
-// Liver — metabolic processing organ. Digests MarketDataEvent → MetabolicEvent.
-builder.Services.AddSingleton<MetabolicArtifactWriter>();
-builder.Services.AddHostedService<LiverService>();
-
-// ML Cortex — predictive organ. Consumes MetabolicEvent → PredictionEvent.
-builder.Services.AddHostedService<MlCortexService>();
-
-// Sleep Cycle — offline learning orchestrator. Resolve → Train in calm windows.
-builder.Services.AddHostedService<SleepCycleService>();
-
-builder.Services
-    .AddMcpServer(options =>
-    {
-        options.ServerInfo = new()
-        {
-            Name = "DeepBlue",
-            Version = "1.0.0"
-        };
-    })
-    .WithHttpTransport()
-    .WithToolsFromAssembly();
-
-builder.Services.AddSingleton<ISkillRegistry, FileSkillRegistry>();
-
-builder.Services.AddSingleton<McpMarketTools>();
-builder.Services.AddSingleton<McpExecutionTools>();
-builder.Services.AddSingleton<McpNewsTools>();
-builder.Services.AddSingleton<McpSkillTools>();
-builder.Services.AddSingleton<McpAetherTools>();
-builder.Services.AddSingleton<IMcpToolRegistry, McpToolRegistry>();
-builder.Services.AddSingleton<McpToolSchemaAdapter>();
-builder.Services.AddSingleton<McpToolInvoker>();
-
-builder.Services.AddSingleton<IAxiom, Axiom>();
-builder.Services.AddSingleton<IArbiter, Arbiter>();
-builder.Services.AddSingleton<IAether, Aether>();
+// ─── Phase 10 Cellular Triad: sector-isolated DI bootstrappers ─────
+// Order is Circulation → Axiom → Aether → Arbiter so that downstream
+// sectors can resolve upstream contracts (IAlephBus, IAxiom) without
+// surprises. Registration order does not affect resolution order for
+// constructor injection, but this order matches the intent of the
+// architecture and keeps the file readable.
+builder.Services.AddCirculation(builder.Configuration);
+builder.Services.AddAxiom(builder.Configuration);
+builder.Services.AddAether(builder.Configuration);
+builder.Services.AddArbiter(builder.Configuration);
 
 builder.Services.AddCors(options =>
 {

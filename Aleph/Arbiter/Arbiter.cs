@@ -12,10 +12,11 @@ public sealed class Arbiter : IArbiter
     private const int MaxStateChangingPerTurn = 1;
 
     private static readonly HttpClient Client = new();
-    private static readonly string ModelId = "gpt-4o-mini";
+    private static readonly string ModelId = "gpt-5.5-pro";
 
     private readonly IAxiom _axiom;
     private readonly IConfiguration _config;
+    private readonly IBenchmarkMetrics _metrics;
     private readonly ILogger<Arbiter> _logger;
 
     private sealed record ToolCallInfo(int Index, string ToolCallId, string ToolName, string ArgumentsJson);
@@ -40,10 +41,12 @@ public sealed class Arbiter : IArbiter
     public Arbiter(
         IAxiom axiom,
         IConfiguration config,
+        IBenchmarkMetrics metrics,
         ILogger<Arbiter> logger)
     {
         _axiom = axiom;
         _config = config;
+        _metrics = metrics;
         _logger = logger;
 
         var apiKey = _config["OpenAI:ApiKey"] ?? string.Empty;
@@ -154,26 +157,95 @@ public sealed class Arbiter : IArbiter
 
             try
             {
+                // ── Compute Arbitrage telemetry: measure round-trip latency
+                // of the upstream LLM proxy call. Stopwatch covers both the
+                // network POST and the body read.
+                var sw = Stopwatch.StartNew();
+
                 var response = await Client.PostAsync(
-                    "https://api.openai.com/v1/chat/completions",
+                    "https://api.muskapi.cc/v1/chat/completions",
                     content,
                     ct);
 
                 var responseString = await response.Content.ReadAsStringAsync(ct);
 
+                sw.Stop();
+                var elapsedMs = sw.ElapsedMilliseconds;
+
                 if (!response.IsSuccessStatusCode)
                 {
-                    return ($"Error: API returned {response.StatusCode}\n{responseString}", uiActions, false, iteration);
+                    // Record the failed exchange so the dashboard still sees the request.
+                    _metrics.RecordRequest(elapsedMs, 0, 0);
+
+                    _logger.LogWarning(
+                        "[Arbiter] Upstream returned HTTP {StatusCode} in {Ms}ms. Body: {Body}",
+                        (int)response.StatusCode,
+                        elapsedMs,
+                        responseString);
+                    return ($"Upstream API Error: {responseString}", uiActions, false, iteration);
                 }
 
+                // Best-effort token extraction from the "usage" block. Defensive — the
+                // upstream may omit usage on safety-filter or error envelopes returned
+                // with HTTP 200. Failures here must not throw.
+                var (promptTokens, completionTokens) = TryReadUsage(responseString);
+                _metrics.RecordRequest(elapsedMs, promptTokens, completionTokens);
+
                 using var doc = JsonDocument.Parse(responseString);
-                var choice = doc.RootElement.GetProperty("choices")[0];
-                var finishReason = choice.GetProperty("finish_reason").GetString() ?? string.Empty;
-                var message = choice.GetProperty("message");
+                var root = doc.RootElement;
+
+                // ── Defensive: provider may return HTTP 200 with an error envelope
+                // (rate limit, safety filter, quota). Detect it before walking "choices".
+                if (root.TryGetProperty("error", out var errorNode))
+                {
+                    var errorText = errorNode.ValueKind == JsonValueKind.String
+                        ? (errorNode.GetString() ?? responseString)
+                        : errorNode.ToString();
+                    _logger.LogWarning(
+                        "[Arbiter] Upstream returned error envelope: {Error}",
+                        errorText);
+                    return ($"Upstream API Error: {errorText}", uiActions, false, iteration);
+                }
+
+                // ── Defensive: ensure the OpenAI-shaped "choices" array exists.
+                if (!root.TryGetProperty("choices", out var choicesElement)
+                    || choicesElement.ValueKind != JsonValueKind.Array
+                    || choicesElement.GetArrayLength() == 0)
+                {
+                    _logger.LogWarning(
+                        "[Arbiter] Upstream response missing or empty 'choices'. Body: {Body}",
+                        responseString);
+                    return ($"Upstream API Error: {responseString}", uiActions, false, iteration);
+                }
+
+                var choice = choicesElement[0];
+
+                // ── Defensive: ensure the assistant message envelope exists.
+                if (!choice.TryGetProperty("message", out var message))
+                {
+                    _logger.LogWarning(
+                        "[Arbiter] Upstream response missing 'message' on first choice. Body: {Body}",
+                        responseString);
+                    return ($"Upstream API Error: {responseString}", uiActions, false, iteration);
+                }
+
+                var finishReason = choice.TryGetProperty("finish_reason", out var finishReasonNode)
+                    ? (finishReasonNode.GetString() ?? string.Empty)
+                    : string.Empty;
 
                 if (finishReason == "tool_calls")
                 {
-                    var toolCalls = message.GetProperty("tool_calls");
+                    // ── Defensive: finish_reason claimed tool_calls but the array may be absent/malformed.
+                    if (!message.TryGetProperty("tool_calls", out var toolCalls)
+                        || toolCalls.ValueKind != JsonValueKind.Array)
+                    {
+                        _logger.LogWarning(
+                            "[Arbiter] finish_reason='tool_calls' but no tool_calls array present. Body: {Body}",
+                            responseString);
+                        return ($"Upstream API Error: malformed tool_calls payload.\n{responseString}",
+                                uiActions, false, iteration);
+                    }
+
                     var toolCount = toolCalls.GetArrayLength();
 
                     _logger.LogInformation(
@@ -304,7 +376,12 @@ public sealed class Arbiter : IArbiter
                 }
                 else
                 {
-                    finalAiResponse = message.GetProperty("content").GetString() ?? string.Empty;
+                    // ── Defensive: content may be absent (e.g. function_call-only branches).
+                    finalAiResponse = message.TryGetProperty("content", out var contentNode)
+                        ? (contentNode.ValueKind == JsonValueKind.String
+                            ? (contentNode.GetString() ?? string.Empty)
+                            : contentNode.ToString())
+                        : string.Empty;
                     history.Add(new { role = "assistant", content = finalAiResponse });
 
                     await _axiom.Chat.AppendMessageAsync(
@@ -321,6 +398,42 @@ public sealed class Arbiter : IArbiter
         }
 
         return (finalAiResponse, uiActions, false, iteration);
+    }
+
+    /// <summary>
+    /// Best-effort extraction of <c>usage.prompt_tokens</c> /
+    /// <c>usage.completion_tokens</c> from the upstream LLM response body.
+    /// Returns (0, 0) on any error or missing field — never throws.
+    /// </summary>
+    private static (int promptTokens, int completionTokens) TryReadUsage(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+            return (0, 0);
+
+        try
+        {
+            using var d = JsonDocument.Parse(body);
+            if (!d.RootElement.TryGetProperty("usage", out var usage)
+                || usage.ValueKind != JsonValueKind.Object)
+            {
+                return (0, 0);
+            }
+
+            var prompt = usage.TryGetProperty("prompt_tokens", out var p)
+                         && p.ValueKind == JsonValueKind.Number
+                ? p.GetInt32()
+                : 0;
+            var completion = usage.TryGetProperty("completion_tokens", out var c)
+                             && c.ValueKind == JsonValueKind.Number
+                ? c.GetInt32()
+                : 0;
+
+            return (prompt, completion);
+        }
+        catch
+        {
+            return (0, 0);
+        }
     }
 
     private async Task<ToolExecResult> ExecuteToolAsync(

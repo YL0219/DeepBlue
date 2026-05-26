@@ -22,6 +22,12 @@ public static class ArbiterBootstrapper
         this IServiceCollection services,
         IConfiguration configuration)
     {
+        // ─── Telemetry: Compute Arbitrage benchmark counters ─────────
+        // In-memory only; process-local; not persisted. Used by both
+        // Arbiter (write path) and AiController (read path).
+        services.AddSingleton<BenchmarkMetrics>();
+        services.AddSingleton<IBenchmarkMetrics>(sp => sp.GetRequiredService<BenchmarkMetrics>());
+
         // ─── Sector contract ─────────────────────────────────────────
         services.AddSingleton<IArbiter, Arbiter>();
 

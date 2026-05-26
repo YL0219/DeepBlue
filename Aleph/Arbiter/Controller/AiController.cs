@@ -7,11 +7,16 @@ namespace Aleph;
 public sealed class AiController : ControllerBase
 {
     private readonly IArbiter _arbiter;
+    private readonly IBenchmarkMetrics _metrics;
     private readonly ILogger<AiController> _logger;
 
-    public AiController(IArbiter arbiter, ILogger<AiController> logger)
+    public AiController(
+        IArbiter arbiter,
+        IBenchmarkMetrics metrics,
+        ILogger<AiController> logger)
     {
         _arbiter = arbiter;
+        _metrics = metrics;
         _logger = logger;
     }
 
@@ -28,6 +33,26 @@ public sealed class AiController : ControllerBase
             uiActions = result.UiActions,
             terminatedByCircuitBreaker = result.TerminatedByCircuitBreaker,
             iterations = result.Iterations
+        });
+    }
+
+    /// <summary>
+    /// Read-only Compute Arbitrage benchmark snapshot. In-memory only;
+    /// resets on process restart. No DB, no trading state.
+    /// </summary>
+    [HttpGet("benchmark")]
+    public IActionResult GetBenchmark()
+    {
+        var snapshot = _metrics.Snapshot();
+
+        return Ok(new
+        {
+            totalRequests = snapshot.TotalRequests,
+            averageLatencyMs = snapshot.AverageLatencyMs,
+            latestLatencyMs = snapshot.LatestLatencyMs,
+            totalPromptTokens = snapshot.TotalPromptTokens,
+            totalCompletionTokens = snapshot.TotalCompletionTokens,
+            totalTokens = snapshot.TotalTokens
         });
     }
 }
